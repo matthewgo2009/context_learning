@@ -11,7 +11,7 @@
     - 鼓励去从context去找到答案（防止从pre train来说/胡说八道）
     - 大模型调用tool去查看context（postive）怎么检测 并 metric
     
-
+/Users/liuyicheng/Project_File/llm_research
 judge challenge solver model
 prompt的定义(modify r zero)
 
