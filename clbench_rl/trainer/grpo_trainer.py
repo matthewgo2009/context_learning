@@ -100,14 +100,14 @@ class GRPOTrainer:
     def _create_challenge_model(self) -> ChallengeModel:
         cm = self.cfg.get("challenge_model", {})
         return ChallengeModel(
-            model_name=cm.get("model_name", "Qwen/Qwen2.5-3B-Instruct"),
+            model_name=cm.get("model_name", "Qwen/Qwen3-4B-Instruct-2507"),
             device=cm.get("device"),
         )
 
     def _create_solver_model(self) -> SolverModel:
         sm = self.cfg.get("solver_model", {})
         return SolverModel(
-            model_name=sm.get("model_name", "Qwen/Qwen2.5-3B-Instruct"),
+            model_name=sm.get("model_name", "Qwen/Qwen3-4B-Instruct-2507"),
             device=sm.get("device"),
         )
 
@@ -115,7 +115,7 @@ class GRPOTrainer:
         """Create a frozen copy of the solver model as the KL reference."""
         sm = self.cfg.get("solver_model", {})
         ref = SolverModel(
-            model_name=sm.get("model_name", "Qwen/Qwen2.5-3B-Instruct"),
+            model_name=sm.get("model_name", "Qwen/Qwen3-4B-Instruct-2507"),
             device=sm.get("device"),
         )
         ref.model.load_state_dict(self.solver_model.model.state_dict())

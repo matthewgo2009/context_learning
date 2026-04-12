@@ -1,6 +1,6 @@
 # 如何运行 CL-bench RL
 
-本文说明从环境准备到各类训练/试跑命令的**完整运行方式**。默认基座模型为 **`Qwen/Qwen2.5-3B-Instruct`**（可在命令行或配置中覆盖）。
+本文说明从环境准备到各类训练/试跑命令的**完整运行方式**。默认基座模型为 **`Qwen/Qwen3-4B-Instruct-2507`**（可在命令行或配置中覆盖）。Qwen3 需 **transformers≥4.51**，见 `requirements.txt`。
 
 ---
 
@@ -90,7 +90,7 @@ python scripts/run_pipeline.py --dry-run --max-samples 5
 加载 **同一 Hugging Face 模型** 作为 Challenger 与 Solver，做环境一步、生成与奖励统计（适合小样本调试）：
 
 ```bash
-python scripts/run_pipeline.py --max-samples 10 --model Qwen/Qwen2.5-3B-Instruct
+python scripts/run_pipeline.py --max-samples 10 --model Qwen/Qwen3-4B-Instruct-2507
 ```
 
 常用参数：
@@ -158,7 +158,7 @@ DeepSpeed 配置见 `configs/ds_config_zero2.json`、`configs/ds_config_zero3.js
 
 | 参数 | 含义 |
 |------|------|
-| `--model` | Challenger / Solver 共用基座（默认 3B） |
+| `--model` | Challenger / Solver 共用基座（默认 Qwen3-4B） |
 | `--solver-model` / `--challenger-model` | 分别覆盖两端模型 |
 | `--epochs` | 训练轮数 |
 | `--lr` | Solver 学习率 |
@@ -213,7 +213,7 @@ cfg = merge_config({
    检查是否设置 `OPENAI_API_KEY`，或是否加了 `--no-llm-judge`。
 
 3. **显存不足**  
-   减小 `--max-samples`、`grpo.group_size`，或换更小模型（保持 3B），或使用 ZeRO 配置 / 更小 batch（若你在代码中调整）。
+   减小 `--max-samples`、`grpo.group_size`，或换更小模型，或使用 ZeRO 配置 / 更小 batch（若你在代码中调整）。
 
 4. **多卡行为**  
    若未配置分布式，多进程可能各自加载完整模型；调试时建议先用**单进程** `--max-samples` 小规模跑通。

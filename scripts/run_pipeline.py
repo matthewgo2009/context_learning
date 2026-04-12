@@ -51,7 +51,7 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="Qwen/Qwen2.5-3B-Instruct",
+        default="Qwen/Qwen3-4B-Instruct-2507",
         help="Model name for both Challenge and Solver (local small model)",
     )
     parser.add_argument(

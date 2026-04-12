@@ -4,7 +4,7 @@
 # 8×H100 80GB launch script
 #
 # Usage:
-#   bash scripts/launch_8gpu.sh                          # default Qwen2.5-3B
+#   bash scripts/launch_8gpu.sh                          # default Qwen3-4B-Instruct
 #   bash scripts/launch_8gpu.sh --model Qwen/Qwen2.5-7B-Instruct  # larger model
 # =============================================================================
 
@@ -36,7 +36,7 @@ MASTER_PORT=${MASTER_PORT:-29500}
 # ---------------------------------------------------------------------------
 # Default training args (can be overridden by passing CLI args to this script)
 # ---------------------------------------------------------------------------
-MODEL="${MODEL:-Qwen/Qwen2.5-3B-Instruct}"
+MODEL="${MODEL:-Qwen/Qwen3-4B-Instruct-2507}"
 EPOCHS="${EPOCHS:-3}"
 SOLVER_LR="${SOLVER_LR:-1e-5}"
 CHALLENGER_LR="${CHALLENGER_LR:-5e-6}"

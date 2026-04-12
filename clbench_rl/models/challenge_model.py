@@ -76,7 +76,7 @@ class ChallengeModel:
 
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen2.5-3B-Instruct",
+        model_name: str = "Qwen/Qwen3-4B-Instruct-2507",
         device: Optional[str] = None,
         use_fast: bool = True,
         system_prompt: Optional[str] = None,

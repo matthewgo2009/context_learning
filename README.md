@@ -37,11 +37,11 @@ python scripts/run_pipeline.py --dry-run --max-samples 5
 
 ## 运行完整流水线（ReinforceTrainer）
 
-会加载本地 Hugging Face 模型（默认 `Qwen/Qwen2.5-3B-Instruct`），对每条样本执行：环境一步 → Solver 生成 → 计算 Solver / Challenge 奖励。**注意**：该路径主要做 rollout 与指标统计；是否保存 checkpoint 由配置中的 `training.save_every` 等决定，与完整 REINFORCE 梯度更新不同。
+会加载本地 Hugging Face 模型（默认 `Qwen/Qwen3-4B-Instruct-2507`），对每条样本执行：环境一步 → Solver 生成 → 计算 Solver / Challenge 奖励。**注意**：该路径主要做 rollout 与指标统计；是否保存 checkpoint 由配置中的 `training.save_every` 等决定，与完整 REINFORCE 梯度更新不同。
 
 ```bash
 # 小样本试跑（建议先限制 max_samples）
-python scripts/run_pipeline.py --max-samples 10 --model Qwen/Qwen2.5-3B-Instruct
+python scripts/run_pipeline.py --max-samples 10 --model Qwen/Qwen3-4B-Instruct-2507
 ```
 
 常用参数：

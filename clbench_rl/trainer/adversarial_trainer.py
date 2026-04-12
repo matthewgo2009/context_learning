@@ -93,20 +93,20 @@ class AdversarialTrainer:
     def _build_solver(self) -> SolverModel:
         sm = self.cfg.get("solver_model", {})
         return SolverModel(
-            model_name=sm.get("model_name", "Qwen/Qwen2.5-3B-Instruct"),
+            model_name=sm.get("model_name", "Qwen/Qwen3-4B-Instruct-2507"),
             device=sm.get("device"),
         )
 
     def _build_challenger(self) -> ChallengeModel:
         cm = self.cfg.get("challenge_model", {})
         return ChallengeModel(
-            model_name=cm.get("model_name", "Qwen/Qwen2.5-3B-Instruct"),
+            model_name=cm.get("model_name", "Qwen/Qwen3-4B-Instruct-2507"),
             device=cm.get("device"),
         )
 
     def _build_reference(self, solver: SolverModel) -> SolverModel:
         sm = self.cfg.get("solver_model", {})
-        ref = SolverModel(model_name=sm.get("model_name", "Qwen/Qwen2.5-3B-Instruct"),
+        ref = SolverModel(model_name=sm.get("model_name", "Qwen/Qwen3-4B-Instruct-2507"),
                           device=sm.get("device"))
         ref.model.load_state_dict(solver.model.state_dict())
         ref.model.eval()
@@ -116,7 +116,7 @@ class AdversarialTrainer:
 
     def _build_reference_challenger(self, challenger: ChallengeModel) -> ChallengeModel:
         cm = self.cfg.get("challenge_model", {})
-        ref = ChallengeModel(model_name=cm.get("model_name", "Qwen/Qwen2.5-3B-Instruct"),
+        ref = ChallengeModel(model_name=cm.get("model_name", "Qwen/Qwen3-4B-Instruct-2507"),
                              device=cm.get("device"))
         ref.model.load_state_dict(challenger.model.state_dict())
         ref.model.eval()
