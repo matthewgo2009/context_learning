@@ -1,4 +1,8 @@
-"""Default configuration for CL-bench RL training."""
+"""Default configuration for CL-bench RL adversarial training.
+
+Aligned with: "Self-Evolving In-Context Learning via Asymmetric Adversarial Play"
+Default scale target: 8×H100 80GB (Qwen2.5-7B-Instruct for both models).
+"""
 
 from typing import Any, Dict, Optional
 
@@ -8,48 +12,55 @@ def get_default_config() -> Dict[str, Any]:
     return {
         "data": {
             "split": "train",
-            "max_samples": 10,
+            "max_samples": None,
             "subset": None,
             "cache_dir": None,
         },
         "challenge_model": {
-            "model_name": "Qwen/Qwen2.5-1.5B-Instruct",
+            "model_name": "Qwen/Qwen2.5-7B-Instruct",
             "device": None,
             "max_new_tokens": 1024,
             "temperature": 0.7,
         },
         "solver_model": {
-            "model_name": "Qwen/Qwen2.5-1.5B-Instruct",
+            "model_name": "Qwen/Qwen2.5-7B-Instruct",
             "device": None,
             "max_new_tokens": 2048,
             "temperature": 0.7,
         },
         "reward": {
-            "use_llm_judge": False,
+            "use_llm_judge": True,
             "judge_model": "gpt-4o",
             "judge_temperature": 0.1,
-            # Challenge reward component weights
-            "challenge_correctness_weight": 1.0,
-            "repetition_penalty_weight": 0.3,
-            "format_penalty_weight": 0.2,
-            "relevance_weight": 0.3,
-            "rubric_quality_weight": 0.2,
-            # Solver reward component weights
-            "solver_correctness_weight": 1.0,
-            "context_grounding_weight": 0.3,
-            "tool_usage_weight": 0.2,
-            # BLEU-clustering repetition penalty (B.4)
+            # Challenger reward weights w1..w5 (paper: dynamic hyperparameters)
+            "w1_adversarial": 1.0,
+            "w2_repetition": 0.3,
+            "w3_format": 0.2,
+            "w4_relevance": 0.3,
+            "w5_rubric": 0.2,
+            # BLEU-clustering repetition penalty (Appendix B.4)
             "bleu_distance_threshold": 0.5,
             "repetition_batch_size": 16,
+            # Dynamic weight scheduling (paper: "dynamic hyperparameters")
+            "use_dynamic_weights": True,
+            "w1_init": 0.3,
+            "w1_final": 1.0,
+            "w3_init": 0.5,
+            "w3_final": 0.1,
         },
         "training": {
             "train_solver": True,
-            "train_challenge": False,
-            "epochs": 1,
+            "train_challenge": True,
+            "epochs": 3,
             "lr": 1e-5,
+            "solver_lr": 1e-5,
+            "challenger_lr": 5e-6,
+            "weight_decay": 0.01,
+            "warmup_ratio": 0.05,
             "checkpoint_dir": "checkpoints",
-            "save_every": 100,
-            "log_every": 5,
+            "save_every": 500,
+            "log_every": 10,
+            "ref_sync_every": 200,
         },
         "grpo": {
             "group_size": 4,

@@ -1,22 +1,25 @@
-"""Rubrics-based reward aligned with the Self-Evolving ICL framework.
+"""Rubrics-based reward strictly aligned with the Self-Evolving ICL paper.
 
-Implements the asymmetric adversarial play reward design:
-  Challenger reward: w1*R_adv - w2*R_rep - w3*R_fmt + w4*R_rel + w5*R_rubric
-  Solver reward:     J_score(A, R) with context grounding and tool-usage bonuses
+Solver objective:
+    max E[J_score(A, R)]
 
-Key components:
-  - R_adv   = 1 - J_score(A, R)
-  - R_rep   = |C_k| / B  (BLEU-clustering batch penalty, Appendix B.4)
-  - R_fmt   = binary format penalty
-  - R_rel   = BLEU(Q, C) · I[J_ans(Q, C) = True]
-  - R_rubric= Similarity(R, E) · J_align(R, E, C)
+Challenger reward (5 components):
+    R_C = w1·R_adv - w2·R_rep - w3·R_fmt + w4·R_rel + w5·R_rubric
 
-Judge: GPT-4o as frozen evaluator (Appendix B.3)
+    R_adv    = 1 - J_score(A, R)
+    R_rep    = |C_k| / B   (BLEU-clustering batch penalty, Appendix B.4)
+    R_fmt    = binary penalty if (Q, E, R) violates structural constraints  {0, 1}
+    R_rel    = BLEU(Q, C) · I[J_ans(Q, C) = True]
+    R_rubric = Similarity(R, E) · J_align(R, E, C)
+
+w1..5 are dynamic hyperparameters (DynamicWeightScheduler).
+Judge: frozen evaluator LLM (Appendix B.3).
 """
 
 import json
 import logging
 import math
+import os
 import re
 from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
@@ -26,6 +29,28 @@ import numpy as np
 from .base_reward import BaseReward, ChallengeRewardResult, SolverRewardResult
 
 logger = logging.getLogger(__name__)
+
+
+def build_judge_api_client(api_key: Optional[str] = None):
+    """Build an OpenAI-compatible API client for the frozen Judge LLM.
+
+    Reads ``OPENAI_API_KEY`` from the environment if *api_key* is not
+    provided.  Returns ``None`` (with a warning) when no key is available,
+    so the system falls back to heuristic grading.
+    """
+    key = api_key or os.environ.get("OPENAI_API_KEY")
+    if not key:
+        logger.warning(
+            "OPENAI_API_KEY not set — Judge LLM will NOT be used; "
+            "falling back to heuristic grading."
+        )
+        return None
+    try:
+        from openai import OpenAI
+        return OpenAI(api_key=key)
+    except Exception as exc:
+        logger.warning("Failed to create OpenAI client: %s", exc)
+        return None
 
 try:
     from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
@@ -208,45 +233,32 @@ def compute_single_repetition_penalty(
 
 # ---------------------------------------------------------------------------
 # Format check  R_fmt  (binary penalty for structural constraint violations)
+#
+# Per the paper: "A binary penalty if (Q, E, R) violates structural constraints."
+# Returns 0 (all three tags present) or 1 (any tag missing).
 # ---------------------------------------------------------------------------
 
-def compute_format_penalty(
-    text: str,
-    min_length: int = 20,
-    max_penalty: float = 1.0,
-) -> float:
-    """
-    Binary format penalty R_fmt.
+def compute_format_penalty(text: str) -> float:
+    """Binary format penalty R_fmt ∈ {0, 1}.
 
-    Checks: minimum length, presence of structured sections (<question>,
-    <evidence>, <rubric> tags), and absence of degenerate patterns.
-    Returns 0.0 (no violation) or -1.0 (violation detected).
+    The paper defines R_fmt as a binary penalty when the Challenger output
+    violates the (Q, E, R) structural constraints.  We check for the presence
+    of all three required XML blocks: <question>, <evidence>, <rubric>.
+
+    Returns:
+        0.0 if all three blocks are present (no violation).
+        1.0 if any block is missing (violation).
     """
     if not text or not text.strip():
-        return -max_penalty
+        return 1.0
 
-    stripped = text.strip()
-    violations = 0
-    total_checks = 4
+    has_question = "<question>" in text and "</question>" in text
+    has_evidence = "<evidence>" in text and "</evidence>" in text
+    has_rubric = "<rubric>" in text and "</rubric>" in text
 
-    if len(stripped) < min_length:
-        violations += 1
-
-    has_question = "<question>" in stripped and "</question>" in stripped
-    if not has_question:
-        violations += 1
-
-    has_evidence = "<evidence>" in stripped and "</evidence>" in stripped
-    if not has_evidence:
-        violations += 1
-
-    alpha_ratio = sum(c.isalpha() or c.isspace() for c in stripped) / max(len(stripped), 1)
-    if alpha_ratio < 0.3:
-        violations += 1
-
-    if violations > 0:
-        return -max_penalty * min(violations / total_checks, 1.0)
-    return 0.0
+    if has_question and has_evidence and has_rubric:
+        return 0.0
+    return 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -359,79 +371,10 @@ def compute_evidence_rubric_similarity(
 
 
 # ---------------------------------------------------------------------------
-# Context grounding (Solver answer grounded in context, not pretrained knowledge)
-# ---------------------------------------------------------------------------
-
-def compute_context_grounding_heuristic(
-    answer: str,
-    context: str,
-    threshold: float = 0.15,
-) -> float:
-    """
-    Heuristic check whether the solver's answer is grounded in the context
-    rather than hallucinated from pretrained knowledge.
-
-    Measures overlap of answer content tokens with context tokens.
-    Returns 1.0 if well-grounded, scaled down toward 0.0 otherwise.
-    """
-    if not answer or not context:
-        return 0.0
-
-    ans_tokens = set(answer.lower().split())
-    ctx_tokens = set(context.lower().split())
-
-    stop_words = {
-        "the", "a", "an", "is", "are", "was", "were", "in", "on", "at",
-        "to", "for", "of", "and", "or", "but", "with", "this", "that",
-        "it", "be", "as", "by", "from", "not", "i", "my", "your",
-    }
-    ans_tokens -= stop_words
-    ctx_tokens -= stop_words
-
-    if not ans_tokens:
-        return 0.0
-
-    overlap = ans_tokens & ctx_tokens
-    ratio = len(overlap) / len(ans_tokens)
-
-    if ratio >= threshold:
-        return min(ratio / 0.5, 1.0)
-    return ratio / threshold * 0.5
-
-
-# ---------------------------------------------------------------------------
-# Tool usage detection (Solver referencing or using context via tools)
-# ---------------------------------------------------------------------------
-
-TOOL_USE_PATTERNS = [
-    r"\b(according to|based on|from the|the (context|passage|text|document) (says|states|mentions|indicates|shows))",
-    r"\b(as (stated|mentioned|described|shown) in)",
-    r"\b(referring to|reference to|cited from)",
-    r"\b(the (given|provided) (information|data|context|text))",
-    r"<tool_call>.*?</tool_call>",
-    r"\[tool\].*?\[/tool\]",
-    r"```tool\b",
-]
-
-
-def detect_tool_usage(answer: str) -> float:
-    """
-    Detect if the solver's answer shows evidence of tool usage or explicit
-    context referencing. Returns a score in [0.0, 1.0].
-    """
-    if not answer:
-        return 0.0
-
-    matches = 0
-    for pattern in TOOL_USE_PATTERNS:
-        if re.search(pattern, answer, re.IGNORECASE | re.DOTALL):
-            matches += 1
-
-    return min(matches / 3.0, 1.0)
-
-
-# ---------------------------------------------------------------------------
 # Dynamic weight scheduler for w1..w5
+#
+# Per the paper: "w1..5 are dynamic hyperparameters balancing difficulty and
+# validity throughout the training progression."
 # ---------------------------------------------------------------------------
 
 class DynamicWeightScheduler:
@@ -491,20 +434,13 @@ class DynamicWeightScheduler:
 # ===========================================================================
 
 class RubricsReward(BaseReward):
-    """
-    Multi-component reward aligned with the Self-Evolving ICL framework.
-
-    Challenger reward (5 components from the paper):
-        R_c = w1·R_adv - w2·R_rep - w3·R_fmt + w4·R_rel + w5·R_rubric
-        where:
-            R_adv   = 1 - J_score(A, R)
-            R_rep   = |C_k| / B  (BLEU clustering)
-            R_fmt   = binary format penalty
-            R_rel   = BLEU(Q, C) · I[J_ans(Q, C) = True]
-            R_rubric= Similarity(R, E) · J_align(R, E, C)
+    """Reward strictly aligned with the Self-Evolving ICL paper.
 
     Solver reward:
-        R_s = J_score(A, R) + grounding_bonus + tool_usage_bonus
+        R_s = J_score(A, R)
+
+    Challenger reward (5 components):
+        R_c = w1·R_adv - w2·R_rep - w3·R_fmt + w4·R_rel + w5·R_rubric
     """
 
     def __init__(
@@ -513,37 +449,27 @@ class RubricsReward(BaseReward):
         judge_model: str = "gpt-4o",
         judge_temperature: float = 0.1,
         api_client=None,
-        sub_category_weights: Optional[Dict[str, float]] = None,
-        # Challenger reward weights (default / static)
+        # Challenger reward weights (default / static fallback)
         w1_adversarial: float = 1.0,
         w2_repetition: float = 0.3,
         w3_format: float = 0.2,
         w4_relevance: float = 0.3,
         w5_rubric: float = 0.2,
-        # Solver reward weights
-        solver_correctness_weight: float = 1.0,
-        context_grounding_weight: float = 0.3,
-        tool_usage_weight: float = 0.2,
         # Repetition penalty clustering params
         bleu_distance_threshold: float = 0.5,
-        # Optional dynamic weight scheduler
+        # Dynamic weight scheduler (paper: "dynamic hyperparameters")
         weight_scheduler: Optional[DynamicWeightScheduler] = None,
     ):
         self.use_llm_judge = use_llm_judge
         self.judge_model = judge_model
         self.judge_temperature = judge_temperature
         self.api_client = api_client
-        self.sub_category_weights = sub_category_weights or {}
 
         self.w1_adversarial = w1_adversarial
         self.w2_repetition = w2_repetition
         self.w3_format = w3_format
         self.w4_relevance = w4_relevance
         self.w5_rubric = w5_rubric
-
-        self.solver_correctness_weight = solver_correctness_weight
-        self.context_grounding_weight = context_grounding_weight
-        self.tool_usage_weight = tool_usage_weight
 
         self.bleu_distance_threshold = bleu_distance_threshold
         self.weight_scheduler = weight_scheduler
@@ -577,58 +503,28 @@ class RubricsReward(BaseReward):
         metadata: Dict[str, Any],
         **kwargs,
     ) -> SolverRewardResult:
-        """
-        Compute solver reward: maximize J_score(A, R).
+        """Compute solver reward: R_s = J_score(A, R).
 
-        Components:
-            1. correctness      : J_score(A, R) from Judge LLM or heuristic
-            2. context_grounding: bonus for context-derived answers
-            3. tool_usage       : bonus for explicit context referencing
+        Per the paper, the Solver objective is purely:
+            max E[J_score(A, R)]
+        where J is the frozen Judge that evaluates Answer A against Rubric R.
         """
         result = SolverRewardResult()
 
         if not answer or not answer.strip():
             return result
 
-        ground_truth = kwargs.get("ground_truth", "")
-
-        # --- 1. J_score(A, R) via GPT-4o judge (B.3) ---
         if self.use_llm_judge and self.api_client:
-            if ground_truth:
-                correctness = self._gpt4o_judge_correctness(answer, ground_truth)
-            else:
-                correctness = self._llm_judge_correctness_rubrics(answer, rubrics)
+            correctness = self._llm_judge_correctness_rubrics(answer, rubrics)
         else:
             correctness = self._heuristic_grade(answer, rubrics)
+
         result.correctness = correctness
-
-        # --- 2. Context grounding reward ---
-        grounding = compute_context_grounding_heuristic(answer, context)
-        if self.use_llm_judge and self.api_client:
-            llm_grounding = self._llm_judge_context_grounding(answer, context)
-            grounding = 0.5 * grounding + 0.5 * llm_grounding
-        result.context_grounding = grounding
-
-        # --- 3. Tool usage / context referencing reward ---
-        result.tool_usage = detect_tool_usage(answer)
-
-        # --- Weighted total ---
-        sub = metadata.get("sub_category", "")
-        cat_weight = self.sub_category_weights.get(sub, 1.0)
-
-        result.total = cat_weight * (
-            self.solver_correctness_weight * result.correctness
-            + self.context_grounding_weight * result.context_grounding
-            + self.tool_usage_weight * result.tool_usage
-        )
+        result.total = correctness
 
         result.details = {
-            "correctness_raw": correctness,
-            "grounding_raw": grounding,
-            "tool_usage_raw": result.tool_usage,
-            "sub_category": sub,
-            "cat_weight": cat_weight,
-            "judge_mode": "gpt4o" if (self.use_llm_judge and self.api_client) else "heuristic",
+            "j_score": correctness,
+            "judge_mode": "llm" if (self.use_llm_judge and self.api_client) else "heuristic",
         }
         return result
 
@@ -647,39 +543,6 @@ class RubricsReward(BaseReward):
             if any(kw in answer_lower for kw in r.split() if len(kw) > 3)
         )
         return min(matched / max(len(valid_rubrics), 1), 1.0)
-
-    def _gpt4o_judge_correctness(self, answer: str, ground_truth: str) -> float:
-        """
-        GPT-4o as judge for answer correctness (Appendix B.3).
-        Returns: 1.0 if "Yes", 0.0 if "No" or error.
-        """
-        try:
-            response = self.api_client.chat.completions.create(
-                model=self.judge_model,
-                temperature=self.judge_temperature,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are an answer correctness checker.",
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Hi, there is an answer: {answer},\n"
-                            f"and the ground truth answer is: {ground_truth},\n"
-                            "please check whether the answer is correct or not, "
-                            "and return the **only** Yes or No."
-                        ),
-                    },
-                ],
-            )
-            text = response.choices[0].message.content.strip().lower()
-            if "yes" in text:
-                return 1.0
-            return 0.0
-        except Exception as e:
-            logger.warning("GPT-4o judge correctness call failed: %s", e)
-            return 0.0
 
     def _llm_judge_correctness_rubrics(self, answer: str, rubrics: List) -> float:
         """J_score(A, R): evaluate answer against rubrics."""
@@ -716,42 +579,6 @@ class RubricsReward(BaseReward):
             logger.warning("LLM judge rubrics call failed: %s", e)
             return 0.0
 
-    def _llm_judge_context_grounding(self, answer: str, context: str) -> float:
-        """Verify the answer is derived from context, not pretrained knowledge."""
-        try:
-            response = self.api_client.chat.completions.create(
-                model=self.judge_model,
-                temperature=self.judge_temperature,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a grounding verification judge.",
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            "Determine whether the answer is derived from the given "
-                            "context or appears to be hallucinated / based on external "
-                            "knowledge.\n"
-                            "Output ONLY a JSON object: "
-                            '{"grounded": 0 or 1, "rationale": "brief explanation"}\n'
-                            "Score 1 if the answer is clearly supported by the context.\n\n"
-                            f"Context:\n{context[:3000]}\n\n"
-                            f"Answer:\n{answer}\n\n"
-                            "JSON output:"
-                        ),
-                    },
-                ],
-            )
-            text = response.choices[0].message.content.strip()
-            text = re.sub(r"^```\w*\n?", "", text)
-            text = re.sub(r"\n?```$", "", text)
-            data = json.loads(text)
-            return float(data.get("grounded", 0))
-        except Exception as e:
-            logger.warning("LLM judge grounding call failed: %s", e)
-            return 0.0
-
     # -----------------------------------------------------------------------
     # Challenge Reward
     # -----------------------------------------------------------------------
@@ -767,16 +594,11 @@ class RubricsReward(BaseReward):
         evidence_span: str = "",
         **kwargs,
     ) -> ChallengeRewardResult:
-        """
-        Compute challenger reward:
+        """Compute challenger reward per the paper:
+
             R_c = w1·R_adv - w2·R_rep - w3·R_fmt + w4·R_rel + w5·R_rubric
 
-        Components:
-            1. R_adv   = 1 - J_score(A, R)              adversarial
-            2. R_rep   = |C_k|/B or single-text fallback repetition penalty
-            3. R_fmt   = binary format penalty            format check
-            4. R_rel   = BLEU(Q,C) · I[J_ans(Q,C)=True]  context relevance
-            5. R_rubric= Sim(R,E) · J_align(R,E,C)       rubric quality
+        All five component values are non-negative.
         """
         result = ChallengeRewardResult()
         output_text = challenge_output or ""
@@ -785,15 +607,15 @@ class RubricsReward(BaseReward):
         # --- 1. R_adv = 1 - J_score(A, R) ---
         result.adversarial = 1.0 - solver_correctness
 
-        # --- 2. R_rep ---
+        # --- 2. R_rep = |C_k| / B  (batch BLEU clustering, Appendix B.4) ---
         batch_rep = kwargs.get("batch_repetition_penalty")
         if batch_rep is not None:
             result.repetition_penalty = float(batch_rep)
         else:
             result.repetition_penalty = abs(compute_single_repetition_penalty(output_text))
 
-        # --- 3. R_fmt (binary) ---
-        result.format_penalty = abs(compute_format_penalty(output_text))
+        # --- 3. R_fmt ∈ {0, 1}  (binary format penalty) ---
+        result.format_penalty = compute_format_penalty(output_text)
 
         # --- 4. R_rel = BLEU(Q, C) · I[J_ans(Q, C) = True] ---
         bleu_qc = compute_bleu_context_relevance(question, context)
@@ -804,18 +626,21 @@ class RubricsReward(BaseReward):
         result.relevance = bleu_qc * answerability
 
         # --- 5. R_rubric = Similarity(R, E) · J_align(R, E, C) ---
-        sim_re = compute_evidence_rubric_similarity(rubrics, evidence_span)
-        if self.use_llm_judge and self.api_client and evidence_span:
-            alignment = self._llm_judge_rubric_evidence_alignment(
-                rubrics, evidence_span, context
-            )
-        elif evidence_span:
-            alignment = self._heuristic_rubric_evidence_alignment(
-                rubrics, evidence_span, context
-            )
+        # Per the paper, R_rubric anchors the rubric to the evidence span E.
+        # When E is not available, Similarity(R, E) = 0 → R_rubric = 0.
+        if evidence_span:
+            sim_re = compute_evidence_rubric_similarity(rubrics, evidence_span)
+            if self.use_llm_judge and self.api_client:
+                alignment = self._llm_judge_rubric_evidence_alignment(
+                    rubrics, evidence_span, context
+                )
+            else:
+                alignment = self._heuristic_rubric_evidence_alignment(
+                    rubrics, evidence_span, context
+                )
+            result.rubric_quality = sim_re * alignment
         else:
-            alignment = self._heuristic_rubric_quality(rubrics) if not evidence_span else 0.0
-        result.rubric_quality = sim_re * alignment if evidence_span else alignment
+            result.rubric_quality = 0.0
 
         # --- Weighted total: w1·R_adv - w2·R_rep - w3·R_fmt + w4·R_rel + w5·R_rubric ---
         w1 = weights["w1_adversarial"]
@@ -841,8 +666,6 @@ class RubricsReward(BaseReward):
             "r_rubric": result.rubric_quality,
             "bleu_qc": bleu_qc,
             "answerability": answerability,
-            "sim_re": sim_re,
-            "alignment": alignment,
             "evidence_span_provided": bool(evidence_span),
             "weights": weights,
             "used_batch_repetition": batch_rep is not None,
@@ -999,107 +822,6 @@ class RubricsReward(BaseReward):
         if e_in_c:
             return min(overlap * 1.2, 1.0)
         return overlap * 0.5
-
-    # -----------------------------------------------------------------------
-    # Relevance (LLM fallback, kept for backward compatibility)
-    # -----------------------------------------------------------------------
-
-    def _llm_judge_relevance(self, context: str, question: str) -> float:
-        """LLM-based relevance — used as part of R_rel when answerability check passes."""
-        try:
-            response = self.api_client.chat.completions.create(
-                model=self.judge_model,
-                temperature=self.judge_temperature,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are evaluating question quality.",
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            "Rate how relevant and meaningful the question is "
-                            "with respect to the given context.\n"
-                            "Output ONLY a JSON object: "
-                            '{"score": <float 0.0-1.0>, "rationale": "brief explanation"}\n'
-                            "1.0 = highly relevant, well-formed question.\n"
-                            "0.0 = irrelevant or nonsensical.\n\n"
-                            f"Context:\n{context[:3000]}\n\n"
-                            f"Question:\n{question}\n\n"
-                            "JSON output:"
-                        ),
-                    },
-                ],
-            )
-            text = response.choices[0].message.content.strip()
-            text = re.sub(r"^```\w*\n?", "", text)
-            text = re.sub(r"\n?```$", "", text)
-            data = json.loads(text)
-            raw = float(data.get("score", 0))
-            return max(0.0, min(1.0, raw))
-        except Exception as e:
-            logger.warning("LLM judge relevance call failed: %s", e)
-            return 0.0
-
-    # -----------------------------------------------------------------------
-    # Rubric quality (standalone, used when evidence_span is not provided)
-    # -----------------------------------------------------------------------
-
-    def _heuristic_rubric_quality(self, rubrics: List) -> float:
-        """
-        Heuristic evaluation of rubric quality.
-        Good rubrics: multiple criteria, each with sufficient detail.
-        """
-        valid = [str(r).strip() for r in rubrics if str(r).strip()]
-        if not valid:
-            return 0.0
-
-        count_score = min(len(valid) / 3.0, 1.0)
-
-        avg_len = sum(len(r) for r in valid) / len(valid)
-        detail_score = min(avg_len / 50.0, 1.0)
-
-        diversity = len(set(r.lower() for r in valid)) / len(valid)
-
-        return (count_score + detail_score + diversity) / 3.0
-
-    def _llm_judge_rubric_quality(self, question: str, rubrics: List) -> float:
-        """LLM-based rubric quality evaluation (without evidence span)."""
-        rubrics_text = build_rubrics_text(rubrics)
-        try:
-            response = self.api_client.chat.completions.create(
-                model=self.judge_model,
-                temperature=self.judge_temperature,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are evaluating rubric quality.",
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            "Rate how well the rubrics serve as evaluation criteria "
-                            "for the given question.\n"
-                            "Output ONLY a JSON object: "
-                            '{"score": <float 0.0-1.0>, "rationale": "brief explanation"}\n'
-                            "1.0 = comprehensive, specific, well-matched rubrics.\n"
-                            "0.0 = missing, vague, or irrelevant rubrics.\n\n"
-                            f"Question:\n{question}\n\n"
-                            f"Rubrics:\n{rubrics_text}\n\n"
-                            "JSON output:"
-                        ),
-                    },
-                ],
-            )
-            text = response.choices[0].message.content.strip()
-            text = re.sub(r"^```\w*\n?", "", text)
-            text = re.sub(r"\n?```$", "", text)
-            data = json.loads(text)
-            raw = float(data.get("score", 0))
-            return max(0.0, min(1.0, raw))
-        except Exception as e:
-            logger.warning("LLM judge rubric quality call failed: %s", e)
-            return 0.0
 
     # -----------------------------------------------------------------------
     # Batch-level repetition (public API)

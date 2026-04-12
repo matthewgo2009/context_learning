@@ -13,6 +13,13 @@ def run_dry_run(max_samples: int) -> None:
     from clbench_rl.data.loader import CLBenchDataLoader
     from clbench_rl.rewards.rubrics_reward import RubricsReward
 
+    def _context_from_messages(messages: list) -> str:
+        parts = []
+        for m in messages:
+            if isinstance(m, dict) and m.get("content"):
+                parts.append(m["content"])
+        return "\n".join(parts)
+
     print("Dry run: loading dataset...")
     loader = CLBenchDataLoader(split="train", max_samples=max_samples)
     loader.load()
@@ -20,12 +27,14 @@ def run_dry_run(max_samples: int) -> None:
 
     total_r = 0.0
     for i, sample in enumerate(loader):
+        ctx = _context_from_messages(sample.get("messages", []))
         r = reward_fn.compute_solver_reward(
             answer="This is a placeholder answer for dry run.",
             rubrics=sample["rubrics"],
+            context=ctx,
             metadata=sample["metadata"],
         )
-        total_r += r
+        total_r += r.total
     avg = total_r / max_samples if max_samples else 0.0
     print(f"Dry run completed. Processed {max_samples} samples.")
     print(f"Mean heuristic solver reward: {avg:.4f}")
@@ -88,8 +97,14 @@ def main():
 
     print("\n" + "=" * 50)
     print("Pipeline completed.")
+    print(f"Mean J_score(A,R):     {metrics['mean_j_score']:.4f}")
     print(f"Mean Solver Reward:    {metrics['mean_solver_reward']:.4f}")
     print(f"Mean Challenge Reward: {metrics['mean_challenge_reward']:.4f}")
+    print(f"Mean R_adv:            {metrics['mean_r_adv']:.4f}")
+    print(f"Mean R_rep:            {metrics['mean_r_rep']:.4f}")
+    print(f"Mean R_fmt:            {metrics['mean_r_fmt']:.4f}")
+    print(f"Mean R_rel:            {metrics['mean_r_rel']:.4f}")
+    print(f"Mean R_rubric:         {metrics['mean_r_rubric']:.4f}")
     print(f"Episodes:              {metrics['num_episodes']}")
     print("=" * 50)
 

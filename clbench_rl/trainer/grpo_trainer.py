@@ -125,21 +125,43 @@ class GRPOTrainer:
         return ref
 
     def _create_reward(self) -> RubricsReward:
+        from ..rewards.rubrics_reward import DynamicWeightScheduler, build_judge_api_client
+
         rw = self.cfg.get("reward", {})
+        train_cfg = self.cfg.get("training", {})
+
+        scheduler = None
+        if rw.get("use_dynamic_weights", False):
+            total_steps = max(
+                train_cfg.get("epochs", 1) * self.cfg.get("data", {}).get("max_samples", 100),
+                1,
+            )
+            scheduler = DynamicWeightScheduler(
+                total_steps=total_steps,
+                w1_init=rw.get("w1_init", 0.3),
+                w1_final=rw.get("w1_final", 1.0),
+                w2=rw.get("w2_repetition", 0.3),
+                w3_init=rw.get("w3_init", 0.5),
+                w3_final=rw.get("w3_final", 0.1),
+                w4=rw.get("w4_relevance", 0.3),
+                w5=rw.get("w5_rubric", 0.2),
+            )
+
+        use_llm = rw.get("use_llm_judge", True)
+        client = build_judge_api_client() if use_llm else None
+
         return RubricsReward(
-            use_llm_judge=rw.get("use_llm_judge", False),
+            use_llm_judge=use_llm,
             judge_model=rw.get("judge_model", "gpt-4o"),
             judge_temperature=rw.get("judge_temperature", 0.1),
-            api_client=None,
-            challenge_correctness_weight=rw.get("challenge_correctness_weight", 1.0),
-            repetition_penalty_weight=rw.get("repetition_penalty_weight", 0.3),
-            format_penalty_weight=rw.get("format_penalty_weight", 0.2),
-            relevance_weight=rw.get("relevance_weight", 0.3),
-            rubric_quality_weight=rw.get("rubric_quality_weight", 0.2),
-            solver_correctness_weight=rw.get("solver_correctness_weight", 1.0),
-            context_grounding_weight=rw.get("context_grounding_weight", 0.3),
-            tool_usage_weight=rw.get("tool_usage_weight", 0.2),
+            api_client=client,
+            w1_adversarial=rw.get("w1_adversarial", 1.0),
+            w2_repetition=rw.get("w2_repetition", 0.3),
+            w3_format=rw.get("w3_format", 0.2),
+            w4_relevance=rw.get("w4_relevance", 0.3),
+            w5_rubric=rw.get("w5_rubric", 0.2),
             bleu_distance_threshold=rw.get("bleu_distance_threshold", 0.5),
+            weight_scheduler=scheduler,
         )
 
     def _create_dataloader(self) -> CLBenchDataLoader:

@@ -72,21 +72,43 @@ class ReinforceTrainer:
         )
 
     def _create_reward(self) -> RubricsReward:
+        from ..rewards.rubrics_reward import DynamicWeightScheduler, build_judge_api_client
+
         rw = self.cfg.get("reward", {})
+        train_cfg = self.cfg.get("training", {})
+
+        scheduler = None
+        if rw.get("use_dynamic_weights", False):
+            total_steps = max(
+                train_cfg.get("epochs", 1) * self.cfg.get("data", {}).get("max_samples", 100),
+                1,
+            )
+            scheduler = DynamicWeightScheduler(
+                total_steps=total_steps,
+                w1_init=rw.get("w1_init", 0.3),
+                w1_final=rw.get("w1_final", 1.0),
+                w2=rw.get("w2_repetition", 0.3),
+                w3_init=rw.get("w3_init", 0.5),
+                w3_final=rw.get("w3_final", 0.1),
+                w4=rw.get("w4_relevance", 0.3),
+                w5=rw.get("w5_rubric", 0.2),
+            )
+
+        use_llm = rw.get("use_llm_judge", True)
+        client = build_judge_api_client() if use_llm else None
+
         return RubricsReward(
-            use_llm_judge=rw.get("use_llm_judge", False),
+            use_llm_judge=use_llm,
             judge_model=rw.get("judge_model", "gpt-4o"),
             judge_temperature=rw.get("judge_temperature", 0.1),
-            api_client=None,
-            challenge_correctness_weight=rw.get("challenge_correctness_weight", 1.0),
-            repetition_penalty_weight=rw.get("repetition_penalty_weight", 0.3),
-            format_penalty_weight=rw.get("format_penalty_weight", 0.2),
-            relevance_weight=rw.get("relevance_weight", 0.3),
-            rubric_quality_weight=rw.get("rubric_quality_weight", 0.2),
-            solver_correctness_weight=rw.get("solver_correctness_weight", 1.0),
-            context_grounding_weight=rw.get("context_grounding_weight", 0.3),
-            tool_usage_weight=rw.get("tool_usage_weight", 0.2),
+            api_client=client,
+            w1_adversarial=rw.get("w1_adversarial", 1.0),
+            w2_repetition=rw.get("w2_repetition", 0.3),
+            w3_format=rw.get("w3_format", 0.2),
+            w4_relevance=rw.get("w4_relevance", 0.3),
+            w5_rubric=rw.get("w5_rubric", 0.2),
             bleu_distance_threshold=rw.get("bleu_distance_threshold", 0.5),
+            weight_scheduler=scheduler,
         )
 
     def _create_dataloader(self) -> CLBenchDataLoader:
@@ -150,10 +172,12 @@ class ReinforceTrainer:
 
         total_solver_r = 0.0
         total_challenge_r = 0.0
-        total_solver_correctness = 0.0
-        total_solver_grounding = 0.0
-        total_challenge_correctness = 0.0
-        total_challenge_repetition = 0.0
+        total_j_score = 0.0
+        total_r_adv = 0.0
+        total_r_rep = 0.0
+        total_r_fmt = 0.0
+        total_r_rel = 0.0
+        total_r_rubric = 0.0
         n = 0
         samples = list(loader)
 
@@ -180,23 +204,24 @@ class ReinforceTrainer:
                 s_bd = result.get("solver_breakdown")
                 c_bd = result.get("challenge_breakdown")
                 if s_bd:
-                    total_solver_correctness += s_bd.correctness
-                    total_solver_grounding += s_bd.context_grounding
+                    total_j_score += s_bd.correctness
                 if c_bd:
-                    total_challenge_correctness += c_bd.correctness
-                    total_challenge_repetition += c_bd.repetition_penalty
+                    total_r_adv += c_bd.adversarial
+                    total_r_rep += c_bd.repetition_penalty
+                    total_r_fmt += c_bd.format_penalty
+                    total_r_rel += c_bd.relevance
+                    total_r_rubric += c_bd.rubric_quality
 
+                self.reward_fn.step()
                 flat_idx += 1
                 iterator.update(1)
 
                 if flat_idx % log_every == 0:
-                    avg_s = total_solver_r / n
-                    avg_c = total_challenge_r / n
                     iterator.set_postfix(
-                        solver_r=round(avg_s, 4),
-                        challenge_r=round(avg_c, 4),
-                        s_correct=round(total_solver_correctness / n, 4),
-                        rep_pen=round(total_challenge_repetition / n, 4),
+                        j_score=round(total_j_score / n, 4),
+                        r_c=round(total_challenge_r / n, 4),
+                        r_adv=round(total_r_adv / n, 4),
+                        r_rep=round(total_r_rep / n, 4),
                     )
 
                 if save_every and flat_idx % save_every == 0:
@@ -207,10 +232,12 @@ class ReinforceTrainer:
         metrics = {
             "mean_solver_reward": total_solver_r / n if n else 0.0,
             "mean_challenge_reward": total_challenge_r / n if n else 0.0,
-            "mean_solver_correctness": total_solver_correctness / n if n else 0.0,
-            "mean_solver_grounding": total_solver_grounding / n if n else 0.0,
-            "mean_challenge_correctness": total_challenge_correctness / n if n else 0.0,
-            "mean_challenge_repetition_penalty": total_challenge_repetition / n if n else 0.0,
+            "mean_j_score": total_j_score / n if n else 0.0,
+            "mean_r_adv": total_r_adv / n if n else 0.0,
+            "mean_r_rep": total_r_rep / n if n else 0.0,
+            "mean_r_fmt": total_r_fmt / n if n else 0.0,
+            "mean_r_rel": total_r_rel / n if n else 0.0,
+            "mean_r_rubric": total_r_rubric / n if n else 0.0,
             "num_episodes": n,
         }
         logger.info("Training complete. Metrics: %s", metrics)

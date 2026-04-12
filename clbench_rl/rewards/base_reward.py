@@ -1,9 +1,12 @@
 """Base reward interface for extensible reward design.
 
 Aligned with the Self-Evolving ICL framework (asymmetric adversarial play):
-  - Challenger generates (Q, E, R) from context C
-  - Solver generates answer A from (C, Q)
-  - Judge scores A against R and verifies (Q, R) validity
+  - Challenger πθc generates (Q, E, R) from context C
+  - Solver πθs generates answer A from (C, Q)
+  - Judge J (frozen) scores A against R and verifies (Q, R) validity
+
+Solver objective:  max E[J_score(A, R)]
+Challenger objective: max E[w1·R_adv - w2·R_rep - w3·R_fmt + w4·R_rel + w5·R_rubric]
 """
 
 from abc import ABC, abstractmethod
@@ -15,14 +18,12 @@ from typing import Any, Dict, List, Optional
 class SolverRewardResult:
     """Structured result for solver reward computation.
 
-    The Solver objective maximizes J_score(A, R) — the Judge's evaluation
-    of Answer A against the Challenger's Rubric R.
+    Per the paper, Solver objective = E[J_score(A, R)].
+    total == correctness == J_score(A, R).
     """
 
     total: float = 0.0
     correctness: float = 0.0
-    context_grounding: float = 0.0
-    tool_usage: float = 0.0
     details: Dict[str, Any] = field(default_factory=dict)
 
 
