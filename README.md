@@ -2,7 +2,7 @@
 
 基于 [tencent/CL-bench](https://huggingface.co/datasets/tencent/CL-bench) 的上下文学习实验框架：Challenge / Solver 双模型、多分量 Rubric 奖励，并支持 **GRPO（Group Relative Policy Optimization）** 对 Solver 做策略梯度更新。
 
-更完整的设计说明见 [`IMPLEMENTATION.md`](IMPLEMENTATION.md)。
+**如何安装与运行（命令、环境变量、多卡启动）见 [`RUN.md`](RUN.md)。**
 
 ## 环境要求
 
@@ -37,11 +37,11 @@ python scripts/run_pipeline.py --dry-run --max-samples 5
 
 ## 运行完整流水线（ReinforceTrainer）
 
-会加载本地 Hugging Face 模型（默认 `Qwen/Qwen2.5-1.5B-Instruct`），对每条样本执行：环境一步 → Solver 生成 → 计算 Solver / Challenge 奖励。**注意**：该路径主要做 rollout 与指标统计；是否保存 checkpoint 由配置中的 `training.save_every` 等决定，与完整 REINFORCE 梯度更新不同，详见 `IMPLEMENTATION.md`。
+会加载本地 Hugging Face 模型（默认 `Qwen/Qwen2.5-3B-Instruct`），对每条样本执行：环境一步 → Solver 生成 → 计算 Solver / Challenge 奖励。**注意**：该路径主要做 rollout 与指标统计；是否保存 checkpoint 由配置中的 `training.save_every` 等决定，与完整 REINFORCE 梯度更新不同。
 
 ```bash
 # 小样本试跑（建议先限制 max_samples）
-python scripts/run_pipeline.py --max-samples 10 --model Qwen/Qwen2.5-1.5B-Instruct
+python scripts/run_pipeline.py --max-samples 10 --model Qwen/Qwen2.5-3B-Instruct
 ```
 
 常用参数：
@@ -96,7 +96,7 @@ reward_fn = RubricsReward(
 )
 ```
 
-具体接入训练循环时，需保证与 `ReinforceTrainer` / `GRPOTrainer` 创建 `RubricsReward` 的方式一致（当前默认 `api_client=None`）。
+训练器在 `use_llm_judge=True` 时会通过 `OPENAI_API_KEY` 自动构建 Judge 的 `api_client`；自定义脚本可如上手动传入 `OpenAI()`。
 
 ## 仓库结构（简要）
 
@@ -109,8 +109,9 @@ clbench_rl/
   rewards/         # RubricsReward 等
   trainer/         # ReinforceTrainer, GRPOTrainer
 scripts/
-  run_pipeline.py  # 命令行入口
-IMPLEMENTATION.md  # 实现说明
+  run_pipeline.py      # 流水线入口
+  train_adversarial.py   # 对抗双 GRPO 训练
+RUN.md                 # 运行说明
 ```
 
 ## 许可证与引用

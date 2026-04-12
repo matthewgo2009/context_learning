@@ -1,7 +1,7 @@
 """Default configuration for CL-bench RL adversarial training.
 
 Aligned with: "Self-Evolving In-Context Learning via Asymmetric Adversarial Play"
-Default scale target: 8×H100 80GB (Qwen2.5-7B-Instruct for both models).
+Default models: Qwen2.5-3B-Instruct for both Challenger and Solver (lighter than 7B).
 """
 
 from typing import Any, Dict, Optional
@@ -17,13 +17,13 @@ def get_default_config() -> Dict[str, Any]:
             "cache_dir": None,
         },
         "challenge_model": {
-            "model_name": "Qwen/Qwen2.5-7B-Instruct",
+            "model_name": "Qwen/Qwen2.5-3B-Instruct",
             "device": None,
             "max_new_tokens": 1024,
             "temperature": 0.7,
         },
         "solver_model": {
-            "model_name": "Qwen/Qwen2.5-7B-Instruct",
+            "model_name": "Qwen/Qwen2.5-3B-Instruct",
             "device": None,
             "max_new_tokens": 2048,
             "temperature": 0.7,

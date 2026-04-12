@@ -19,7 +19,7 @@ class SolverModel:
 
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen2.5-1.5B-Instruct",
+        model_name: str = "Qwen/Qwen2.5-3B-Instruct",
         device: Optional[str] = None,
         use_fast: bool = True,
         system_prompt: Optional[str] = None,

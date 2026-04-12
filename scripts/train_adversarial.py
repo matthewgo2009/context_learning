@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 def parse_args():
     p = argparse.ArgumentParser(description="Adversarial self-play training")
 
-    p.add_argument("--model", type=str, default="Qwen/Qwen2.5-7B-Instruct",
+    p.add_argument("--model", type=str, default="Qwen/Qwen2.5-3B-Instruct",
                     help="Base model for both Solver and Challenger")
     p.add_argument("--solver-model", type=str, default=None,
                     help="Override model for Solver (defaults to --model)")
