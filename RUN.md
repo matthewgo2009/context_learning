@@ -184,6 +184,7 @@ python scripts/run_pipeline.py --max-samples 10 --model Qwen/Qwen3-4B-Instruct-2
 ```
 
 | 参数 | 含义 |
+
 |------|------|
 | `--max-samples` | 最多样本数 |
 | `--model` | 双端共用模型名 |

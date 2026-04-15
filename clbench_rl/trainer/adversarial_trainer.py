@@ -16,7 +16,9 @@ Training loop (per epoch):
 Supports DeepSpeed ZeRO via Accelerate for 8×H100 training.
 """
 
+import json
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -28,7 +30,7 @@ from ..config.default_config import merge_config
 from ..data.loader import CLBenchDataLoader
 from ..models.challenge_model import ChallengeModel, parse_challenger_output
 from ..models.solver_model import SolverModel
-from ..rewards.base_reward import ChallengeRewardResult, SolverRewardResult
+from ..rewards.base_reward import ChallengeRewardResult
 from ..rewards.rubrics_reward import DynamicWeightScheduler, RubricsReward
 from ..utils.metrics_logger import MetricsLogger
 
@@ -63,8 +65,14 @@ class AdversarialTrainer:
         self.max_grad_norm = grpo.get("max_grad_norm", 1.0)
         self.mu_iterations = grpo.get("mu_iterations", 1)
 
+        self.solver_device, self.challenger_device = self._assign_devices()
+
         self.solver = self._build_solver()
         self.challenger = self._build_challenger()
+
+        self.solver.enable_gradient_checkpointing()
+        self.challenger.enable_gradient_checkpointing()
+
         self.solver_ref = self._build_reference(self.solver)
         self.challenger_ref = self._build_reference_challenger(self.challenger)
         self.reward_fn = self._build_reward()
@@ -88,6 +96,21 @@ class AdversarialTrainer:
         self.rep_batch_size = rw_cfg.get("repetition_batch_size", 16)
 
     # ------------------------------------------------------------------
+    # Device assignment
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _assign_devices():
+        n = torch.cuda.device_count()
+        if n >= 2:
+            logger.info("2+ GPUs detected — solver→cuda:0, challenger→cuda:1")
+            return "cuda:0", "cuda:1"
+        if n == 1:
+            logger.info("Single GPU — all models on cuda:0")
+            return "cuda:0", "cuda:0"
+        return "cpu", "cpu"
+
+    # ------------------------------------------------------------------
     # Model builders
     # ------------------------------------------------------------------
 
@@ -95,20 +118,22 @@ class AdversarialTrainer:
         sm = self.cfg.get("solver_model", {})
         return SolverModel(
             model_name=sm.get("model_name", "Qwen/Qwen3-4B-Instruct-2507"),
-            device=sm.get("device"),
+            device=sm.get("device") or self.solver_device,
         )
 
     def _build_challenger(self) -> ChallengeModel:
         cm = self.cfg.get("challenge_model", {})
         return ChallengeModel(
             model_name=cm.get("model_name", "Qwen/Qwen3-4B-Instruct-2507"),
-            device=cm.get("device"),
+            device=cm.get("device") or self.challenger_device,
         )
 
     def _build_reference(self, solver: SolverModel) -> SolverModel:
         sm = self.cfg.get("solver_model", {})
-        ref = SolverModel(model_name=sm.get("model_name", "Qwen/Qwen3-4B-Instruct-2507"),
-                          device=sm.get("device"))
+        ref = SolverModel(
+            model_name=sm.get("model_name", "Qwen/Qwen3-4B-Instruct-2507"),
+            device=sm.get("device") or self.solver_device,
+        )
         ref.model.load_state_dict(solver.model.state_dict())
         ref.model.eval()
         for p in ref.model.parameters():
@@ -117,8 +142,10 @@ class AdversarialTrainer:
 
     def _build_reference_challenger(self, challenger: ChallengeModel) -> ChallengeModel:
         cm = self.cfg.get("challenge_model", {})
-        ref = ChallengeModel(model_name=cm.get("model_name", "Qwen/Qwen3-4B-Instruct-2507"),
-                             device=cm.get("device"))
+        ref = ChallengeModel(
+            model_name=cm.get("model_name", "Qwen/Qwen3-4B-Instruct-2507"),
+            device=cm.get("device") or self.challenger_device,
+        )
         ref.model.load_state_dict(challenger.model.state_dict())
         ref.model.eval()
         for p in ref.model.parameters():
@@ -175,60 +202,71 @@ class AdversarialTrainer:
         t = torch.tensor(rewards, dtype=torch.float32)
         return ((t - t.mean()) / (t.std() + eps)).tolist()
 
-    def _grpo_loss(
-        self,
-        model,
-        ref_model,
-        group: GroupResult,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """Compute clipped policy gradient loss + KL penalty for a group."""
-        device = model.model.device
-        policy_losses = []
-        kl_penalties = []
-
-        for i in range(len(group.responses)):
-            gen_ids = group.generated_ids_list[i]
-            if gen_ids.numel() == 0:
-                continue
-
-            cur_lp = model.compute_per_token_logprobs(group.input_ids, gen_ids)
-            old_lp = model.compute_per_token_logprobs_detached(group.input_ids, gen_ids)
-            ref_lp = ref_model.compute_per_token_logprobs_detached(group.input_ids, gen_ids)
-
-            ratio = torch.exp(cur_lp - old_lp)
-            adv = torch.tensor(group.advantages[i], device=device, dtype=torch.float32)
-
-            surr1 = ratio * adv
-            surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv
-            policy_losses.append(-torch.min(surr1, surr2).mean())
-            kl_penalties.append((cur_lp - ref_lp).mean())
-
-        if not policy_losses:
-            return torch.tensor(0.0, device=device, requires_grad=True), {}
-
-        p_loss = torch.stack(policy_losses).mean()
-        kl = torch.stack(kl_penalties).mean()
-        total = p_loss + self.kl_beta * kl
-
-        return total, {
-            "policy_loss": p_loss.item(),
-            "kl": kl.item(),
-            "total_loss": total.item(),
-        }
-
     def _do_grpo_update(self, model, ref_model, optimizer, group: GroupResult):
-        """Run mu_iterations of GRPO updates on `model`."""
-        metrics = {}
+        """Per-trajectory GRPO: only one computation graph alive at a time."""
+        metrics: Dict[str, float] = {}
+        device = model.model.device
+        G = len(group.responses)
+        input_ids = group.input_ids.to(device)
+
         for _ in range(self.mu_iterations):
             model.model.train()
+
+            # Phase 1: pre-compute ref logprobs (frozen, no graph)
+            ref_lps: List[Optional[torch.Tensor]] = []
+            for i in range(G):
+                gen_ids = group.generated_ids_list[i].to(device)
+                if gen_ids.numel() == 0:
+                    ref_lps.append(None)
+                    continue
+                ref_lps.append(
+                    ref_model.compute_per_token_logprobs_detached(input_ids, gen_ids)
+                )
+
+            # Phase 2: per-trajectory forward + immediate backward
             optimizer.zero_grad()
-            loss, metrics = self._grpo_loss(model, ref_model, group)
-            if loss.requires_grad:
-                loss.backward()
+            n_valid = 0
+            sum_policy = 0.0
+            sum_kl = 0.0
+
+            for i in range(G):
+                gen_ids = group.generated_ids_list[i].to(device)
+                if gen_ids.numel() == 0 or ref_lps[i] is None:
+                    continue
+
+                cur_lp = model.compute_per_token_logprobs(input_ids, gen_ids)
+                old_lp = cur_lp.detach()
+
+                ratio = torch.exp(cur_lp - old_lp)
+                adv = torch.tensor(
+                    group.advantages[i], device=device, dtype=torch.float32
+                )
+                surr1 = ratio * adv
+                surr2 = torch.clamp(
+                    ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps
+                ) * adv
+                p_loss_i = -torch.min(surr1, surr2).mean()
+                kl_i = (cur_lp - ref_lps[i]).mean()
+
+                loss_i = (p_loss_i + self.kl_beta * kl_i) / max(G, 1)
+                loss_i.backward()
+
+                sum_policy += p_loss_i.item()
+                sum_kl += kl_i.item()
+                n_valid += 1
+
+            if n_valid > 0:
                 torch.nn.utils.clip_grad_norm_(
                     model.model.parameters(), self.max_grad_norm
                 )
                 optimizer.step()
+
+            n = max(n_valid, 1)
+            metrics = {
+                "policy_loss": sum_policy / n,
+                "kl": sum_kl / n,
+                "total_loss": (sum_policy + self.kl_beta * sum_kl) / n,
+            }
         return metrics
 
     # ------------------------------------------------------------------
@@ -242,6 +280,31 @@ class AdversarialTrainer:
             if isinstance(m, dict) and m.get("content"):
                 parts.append(m["content"])
         return "\n".join(parts)
+
+    @staticmethod
+    def _truncate_text(text: str, max_chars: int) -> str:
+        if max_chars <= 0 or len(text) <= max_chars:
+            return text
+        return text[:max_chars] + f"\n... [truncated, {len(text)} chars total]"
+
+    @staticmethod
+    def _json_safe(obj: Any) -> Any:
+        if isinstance(obj, dict):
+            return {str(k): AdversarialTrainer._json_safe(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [AdversarialTrainer._json_safe(x) for x in obj]
+        if isinstance(obj, (str, int, float, bool)) or obj is None:
+            return obj
+        return str(obj)
+
+    def _append_rollout_trace(
+        self,
+        path: Path,
+        record: Dict[str, Any],
+    ) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     # ------------------------------------------------------------------
     # Main training loop
@@ -269,6 +332,22 @@ class AdversarialTrainer:
         log_every = train_cfg.get("log_every", 10)
         save_every = train_cfg.get("save_every", 500)
         ref_sync_every = train_cfg.get("ref_sync_every", 200)
+
+        save_rollouts = train_cfg.get("save_rollout_traces", True)
+        is_rank0 = int(os.environ.get("LOCAL_RANK", "0")) == 0
+        ckpt_root = Path(train_cfg.get("checkpoint_dir", "checkpoints"))
+        trace_dir_cfg = train_cfg.get("rollout_trace_dir")
+        rollout_trace_dir = (
+            Path(trace_dir_cfg)
+            if trace_dir_cfg
+            else ckpt_root / "rollout_traces"
+        )
+        max_ctx = int(train_cfg.get("rollout_log_max_context_chars", 8000))
+        max_field = int(train_cfg.get("rollout_log_max_field_chars", 16000))
+        rollout_jsonl = rollout_trace_dir / "training_rollouts.jsonl"
+        if save_rollouts and is_rank0:
+            rollout_trace_dir.mkdir(parents=True, exist_ok=True)
+            logger.info("Rollout traces → %s", rollout_jsonl)
 
         cm_cfg = self.cfg.get("challenge_model", {})
         sm_cfg = self.cfg.get("solver_model", {})
@@ -327,6 +406,7 @@ class AdversarialTrainer:
                 # For each challenger output, compute challenger reward
                 # We need a solver answer first — generate one quick answer per (Q,E,R)
                 c_rewards = []
+                c_reward_details: List[ChallengeRewardResult] = []
                 best_idx = 0
                 best_c_reward = float("-inf")
 
@@ -364,6 +444,7 @@ class AdversarialTrainer:
                         batch_repetition_penalty=rep_val,
                     )
                     c_rewards.append(c_result.total)
+                    c_reward_details.append(c_result)
 
                     if c_result.total > best_c_reward:
                         best_c_reward = c_result.total
@@ -382,6 +463,8 @@ class AdversarialTrainer:
                     self.challenger, self.challenger_ref,
                     self.challenger_optimizer, c_group,
                 )
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
                 # === Phase 3: Solver generates G answers for best (Q,E,R) ===
                 best_parsed = parsed_outputs[best_idx]
@@ -427,11 +510,75 @@ class AdversarialTrainer:
                     self.solver, self.solver_ref,
                     self.solver_optimizer, s_group,
                 )
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
                 # === Metrics ===
                 self.reward_fn.step()
                 global_step += 1
                 n += 1
+
+                if save_rollouts and is_rank0:
+                    cand = []
+                    for gi, parsed in enumerate(parsed_outputs):
+                        cr = c_reward_details[gi]
+                        cand.append({
+                            "index": gi,
+                            "question": self._truncate_text(
+                                parsed.question or "", max_field
+                            ),
+                            "evidence_span": self._truncate_text(
+                                parsed.evidence_span or "", max_field
+                            ),
+                            "rubric": self._truncate_text(
+                                parsed.rubric or "", max_field
+                            ),
+                            "raw_response": self._truncate_text(
+                                c_texts[gi], max_field
+                            ),
+                            "total_reward": cr.total,
+                            "adversarial": cr.adversarial,
+                            "repetition_penalty": cr.repetition_penalty,
+                            "format_penalty": cr.format_penalty,
+                            "relevance": cr.relevance,
+                            "rubric_quality": cr.rubric_quality,
+                            "details": self._json_safe(cr.details),
+                        })
+                    solver_rows = []
+                    for j, (ans, sr) in enumerate(zip(s_texts, s_breakdowns)):
+                        solver_rows.append({
+                            "index": j,
+                            "answer": self._truncate_text(ans, max_field),
+                            "total_reward": sr.total,
+                            "correctness": sr.correctness,
+                            "details": self._json_safe(sr.details),
+                        })
+                    trace_rec = {
+                        "global_step": global_step,
+                        "epoch": epoch,
+                        "sample_metadata": self._json_safe(
+                            sample.get("metadata") or {}
+                        ),
+                        "context_preview": self._truncate_text(context, max_ctx),
+                        "challenger_group_size": len(c_texts),
+                        "best_challenger_index": best_idx,
+                        "mean_challenger_reward": sum(c_rewards) / max(len(c_rewards), 1),
+                        "challenger_candidates": cand,
+                        "best_question": self._truncate_text(best_q, max_field),
+                        "best_rubric": self._truncate_text(
+                            best_parsed.rubric or "", max_field
+                        ),
+                        "solver_on_best": {
+                            "mean_reward": sum(s_rewards) / max(len(s_rewards), 1),
+                            "mean_judge_score": sum(
+                                sr.correctness for sr in s_breakdowns
+                            ) / max(len(s_breakdowns), 1),
+                            "answers": solver_rows,
+                        },
+                        "challenger_loss": c_metrics.get("total_loss", 0.0),
+                        "solver_loss": s_metrics.get("total_loss", 0.0),
+                    }
+                    self._append_rollout_trace(rollout_jsonl, trace_rec)
 
                 mean_j = sum(sr.correctness for sr in s_breakdowns) / max(len(s_breakdowns), 1)
                 acc["solver_reward"] += sum(s_rewards) / max(len(s_rewards), 1)
@@ -476,10 +623,14 @@ class AdversarialTrainer:
         ml.close()
         logger.info("Metrics saved to %s", metrics_path)
 
-        return {k: v / max(n, 1) for k, v in acc.items()} | {
-            "global_steps": global_step, "epochs": epochs,
+        out = {k: v / max(n, 1) for k, v in acc.items()} | {
+            "global_steps": global_step,
+            "epochs": epochs,
             "metrics_file": str(metrics_path),
         }
+        if save_rollouts and is_rank0:
+            out["rollout_trace_file"] = str(rollout_jsonl)
+        return out
 
     # ------------------------------------------------------------------
     # Checkpointing & reference sync

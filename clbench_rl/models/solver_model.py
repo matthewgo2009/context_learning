@@ -37,14 +37,25 @@ class SolverModel:
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_name, trust_remote_code=True, use_fast=use_fast
         )
+        if self.device.startswith("cuda"):
+            _dmap = {"": self.device} if ":" in self.device else "auto"
+            _dtype = torch.bfloat16
+        else:
+            _dmap = None
+            _dtype = torch.float32
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-            device_map="auto" if self.device == "cuda" else None,
+            torch_dtype=_dtype,
+            device_map=_dmap,
             trust_remote_code=True,
         )
-        if self.device == "cpu":
+        if not self.device.startswith("cuda"):
             self.model = self.model.to(self.device)
+
+    def enable_gradient_checkpointing(self):
+        self.model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
 
     def build_solver_messages(
         self, question: str, context: str = ""
@@ -223,12 +234,10 @@ class SolverModel:
             return torch.tensor(0.0, device=self.model.device, requires_grad=True)
 
         full_ids = torch.cat([input_ids, generated_ids], dim=1)
-        outputs = self.model(full_ids)
-        logits = outputs.logits.float()
-
+        outputs = self.model(full_ids, use_cache=False)
         input_len = input_ids.shape[1]
-        shift_logits = logits[:, input_len - 1:-1, :]
-        log_probs = F.log_softmax(shift_logits, dim=-1)
+        shift_logits = outputs.logits[:, input_len - 1:-1, :]
+        log_probs = F.log_softmax(shift_logits.float(), dim=-1)
         token_log_probs = log_probs.gather(2, generated_ids.unsqueeze(-1)).squeeze(-1)
         return token_log_probs.mean(dim=-1).squeeze(0)
 
@@ -251,12 +260,10 @@ class SolverModel:
             return torch.zeros(0, device=self.model.device, requires_grad=True)
 
         full_ids = torch.cat([input_ids, generated_ids], dim=1)
-        outputs = self.model(full_ids)
-        logits = outputs.logits.float()
-
+        outputs = self.model(full_ids, use_cache=False)
         input_len = input_ids.shape[1]
-        shift_logits = logits[:, input_len - 1:-1, :]
-        log_probs = F.log_softmax(shift_logits, dim=-1)
+        shift_logits = outputs.logits[:, input_len - 1:-1, :]
+        log_probs = F.log_softmax(shift_logits.float(), dim=-1)
         token_log_probs = log_probs.gather(2, generated_ids.unsqueeze(-1)).squeeze(-1)
         return token_log_probs.squeeze(0)
 
@@ -280,12 +287,10 @@ class SolverModel:
             return torch.zeros(0, device=self.model.device)
 
         full_ids = torch.cat([input_ids, generated_ids], dim=1)
-        outputs = self.model(full_ids)
-        logits = outputs.logits.float()
-
+        outputs = self.model(full_ids, use_cache=False)
         input_len = input_ids.shape[1]
-        shift_logits = logits[:, input_len - 1:-1, :]
-        log_probs = F.log_softmax(shift_logits, dim=-1)
+        shift_logits = outputs.logits[:, input_len - 1:-1, :]
+        log_probs = F.log_softmax(shift_logits.float(), dim=-1)
         token_log_probs = log_probs.gather(2, generated_ids.unsqueeze(-1)).squeeze(-1)
         return token_log_probs.squeeze(0)
 

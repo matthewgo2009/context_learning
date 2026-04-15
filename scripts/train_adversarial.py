@@ -55,6 +55,19 @@ def parse_args():
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--ref-sync-every", type=int, default=200)
 
+    p.add_argument(
+        "--rollout-trace-dir",
+        type=str,
+        default=None,
+        help="Directory for per-step JSONL (Q, rubric, rewards). "
+        "Default: <checkpoint-dir>/rollout_traces",
+    )
+    p.add_argument(
+        "--no-rollout-traces",
+        action="store_true",
+        help="Disable writing rollout trace JSONL",
+    )
+
     p.add_argument("--use-llm-judge", action="store_true", default=True,
                     help="Use frozen LLM as Judge (default: True, requires OPENAI_API_KEY)")
     p.add_argument("--no-llm-judge", dest="use_llm_judge", action="store_false",
@@ -102,6 +115,8 @@ def main():
             "save_every": args.save_every,
             "log_every": args.log_every,
             "ref_sync_every": args.ref_sync_every,
+            "save_rollout_traces": not args.no_rollout_traces,
+            "rollout_trace_dir": args.rollout_trace_dir,
         },
         "grpo": {
             "group_size": args.group_size,
