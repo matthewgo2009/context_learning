@@ -37,20 +37,12 @@ class SolverModel:
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_name, trust_remote_code=True, use_fast=use_fast
         )
-        if self.device.startswith("cuda"):
-            _dmap = {"": self.device} if ":" in self.device else "auto"
-            _dtype = torch.bfloat16
-        else:
-            _dmap = None
-            _dtype = torch.float32
+        _dtype = torch.bfloat16 if self.device.startswith("cuda") else torch.float32
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=_dtype,
-            device_map=_dmap,
             trust_remote_code=True,
-        )
-        if not self.device.startswith("cuda"):
-            self.model = self.model.to(self.device)
+        ).to(self.device)
 
     def enable_gradient_checkpointing(self):
         self.model.gradient_checkpointing_enable(
