@@ -83,12 +83,15 @@ class AdversarialTrainer:
         self.reward_fn = self._build_reward()
 
         train_cfg = self.cfg.get("training", {})
-        self.solver_optimizer = torch.optim.AdamW(
+        use_8bit = train_cfg.get("use_8bit_optimizer", True)
+        AdamWCls = self._resolve_adamw(use_8bit)
+
+        self.solver_optimizer = AdamWCls(
             self.solver.model.parameters(),
             lr=train_cfg.get("solver_lr", train_cfg.get("lr", 1e-5)),
             weight_decay=train_cfg.get("weight_decay", 0.01),
         )
-        self.challenger_optimizer = torch.optim.AdamW(
+        self.challenger_optimizer = AdamWCls(
             self.challenger.model.parameters(),
             lr=train_cfg.get("challenger_lr", train_cfg.get("lr", 1e-5)),
             weight_decay=train_cfg.get("weight_decay", 0.01),
@@ -103,6 +106,26 @@ class AdversarialTrainer:
     # ------------------------------------------------------------------
     # Device assignment
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_adamw(use_8bit: bool):
+        """Return an AdamW-like optimizer class.
+
+        Prefer bitsandbytes PagedAdamW8bit when available — cuts optimizer
+        state memory from ~32 GB to ~4 GB per 4B model, which is critical
+        for fitting dual-model adversarial GRPO on 2×80 GB.
+        """
+        if use_8bit:
+            try:
+                import bitsandbytes as bnb
+                logger.info("Using bitsandbytes PagedAdamW8bit (saves ~28 GB/GPU)")
+                return bnb.optim.PagedAdamW8bit
+            except ImportError:
+                logger.warning(
+                    "bitsandbytes not installed — falling back to torch.optim.AdamW. "
+                    "Install with: pip install bitsandbytes"
+                )
+        return torch.optim.AdamW
 
     @staticmethod
     def _assign_devices():
@@ -366,6 +389,10 @@ class AdversarialTrainer:
         cm_cfg = self.cfg.get("challenge_model", {})
         sm_cfg = self.cfg.get("solver_model", {})
 
+        # Input-length caps to bound activation memory.
+        max_ctx_ch = int(train_cfg.get("max_context_chars_challenger", 6000))
+        max_ctx_sv = int(train_cfg.get("max_context_chars_solver", 4000))
+
         samples = list(loader)
         global_step = 0
 
@@ -391,7 +418,9 @@ class AdversarialTrainer:
                     continue
 
                 context = self._extract_context(messages)
-                challenger_messages = self.challenger.build_context_messages(context)
+                ch_context = context[:max_ctx_ch] if max_ctx_ch > 0 else context
+                sv_context = context[:max_ctx_sv] if max_ctx_sv > 0 else context
+                challenger_messages = self.challenger.build_context_messages(ch_context)
 
                 # === Phase 1: Challenger generates G (Q,E,R) ===
                 c_group_raw = self.challenger.generate_group(
@@ -427,7 +456,7 @@ class AdversarialTrainer:
                 for gi, parsed in enumerate(parsed_outputs):
                     q_text = parsed.question or c_texts[gi]
                     solver_msgs = [
-                        {"role": "system", "content": context[:2000]},
+                        {"role": "system", "content": sv_context[:2000]},
                         {"role": "user", "content": q_text},
                     ]
                     with torch.no_grad():
@@ -486,7 +515,7 @@ class AdversarialTrainer:
                 best_rubrics = [best_parsed.rubric] if best_parsed.rubric else sample.get("rubrics", [])
 
                 solver_prompt = [
-                    {"role": "system", "content": context[:4000]},
+                    {"role": "system", "content": sv_context},
                     {"role": "user", "content": best_q},
                 ]
 

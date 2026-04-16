@@ -68,6 +68,24 @@ def parse_args():
         help="Disable writing rollout trace JSONL",
     )
 
+    p.add_argument(
+        "--no-8bit-optimizer",
+        action="store_true",
+        help="Disable bitsandbytes 8-bit AdamW (use torch.optim.AdamW instead)",
+    )
+    p.add_argument(
+        "--max-ctx-chars-challenger",
+        type=int,
+        default=None,
+        help="Truncate context to N chars before feeding the challenger",
+    )
+    p.add_argument(
+        "--max-ctx-chars-solver",
+        type=int,
+        default=None,
+        help="Truncate context to N chars before feeding the solver",
+    )
+
     p.add_argument("--use-llm-judge", action="store_true", default=True,
                     help="Use frozen LLM as Judge (default: True, requires OPENAI_API_KEY)")
     p.add_argument("--no-llm-judge", dest="use_llm_judge", action="store_false",
@@ -117,6 +135,15 @@ def main():
             "ref_sync_every": args.ref_sync_every,
             "save_rollout_traces": not args.no_rollout_traces,
             "rollout_trace_dir": args.rollout_trace_dir,
+            "use_8bit_optimizer": not args.no_8bit_optimizer,
+            **(
+                {"max_context_chars_challenger": args.max_ctx_chars_challenger}
+                if args.max_ctx_chars_challenger is not None else {}
+            ),
+            **(
+                {"max_context_chars_solver": args.max_ctx_chars_solver}
+                if args.max_ctx_chars_solver is not None else {}
+            ),
         },
         "grpo": {
             "group_size": args.group_size,

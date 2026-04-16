@@ -61,11 +61,16 @@ def get_default_config() -> Dict[str, Any]:
             "save_every": 500,
             "log_every": 10,
             "ref_sync_every": 200,
+            # Memory: 8-bit AdamW cuts optimizer state ~32GB → ~4GB per 4B model
+            "use_8bit_optimizer": True,
             # Per-step JSONL logs: questions, rubrics, rewards (for quality tracking)
             "save_rollout_traces": True,
             "rollout_trace_dir": None,
             "rollout_log_max_context_chars": 8000,
             "rollout_log_max_field_chars": 16000,
+            # Input-length caps (char-level pre-tokenization)
+            "max_context_chars_challenger": 6000,
+            "max_context_chars_solver": 4000,
         },
         "grpo": {
             "group_size": 4,
