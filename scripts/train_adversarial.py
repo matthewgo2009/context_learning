@@ -41,7 +41,10 @@ def parse_args():
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--lr", type=float, default=1e-5, help="Solver LR")
     p.add_argument("--challenger-lr", type=float, default=5e-6, help="Challenger LR")
-    p.add_argument("--group-size", type=int, default=4, help="GRPO group size G")
+    p.add_argument(
+        "--group-size", type=int, default=2,
+        help="GRPO group size G (default 2 for 80GB VRAM; use 4 if memory allows)",
+    )
     p.add_argument("--kl-beta", type=float, default=0.04, help="KL penalty coefficient")
     p.add_argument("--clip-eps", type=float, default=0.2, help="PPO clip epsilon")
 
@@ -102,6 +105,18 @@ def parse_args():
         help="Truncate context to N chars before feeding the solver",
     )
     p.add_argument(
+        "--challenger-max-new-tokens",
+        type=int,
+        default=None,
+        help="Max new tokens for challenger generate (default from default_config)",
+    )
+    p.add_argument(
+        "--solver-max-new-tokens",
+        type=int,
+        default=None,
+        help="Max new tokens for solver generate / quick-answer (default from default_config)",
+    )
+    p.add_argument(
         "--colocate-models",
         dest="colocate_models",
         action="store_true",
@@ -153,9 +168,17 @@ def main():
         },
         "challenge_model": {
             "model_name": challenger_model,
+            **(
+                {"max_new_tokens": args.challenger_max_new_tokens}
+                if args.challenger_max_new_tokens is not None else {}
+            ),
         },
         "solver_model": {
             "model_name": solver_model,
+            **(
+                {"max_new_tokens": args.solver_max_new_tokens}
+                if args.solver_max_new_tokens is not None else {}
+            ),
         },
         "reward": {
             "use_llm_judge": args.use_llm_judge,

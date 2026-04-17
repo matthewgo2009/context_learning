@@ -19,13 +19,15 @@ def get_default_config() -> Dict[str, Any]:
         "challenge_model": {
             "model_name": "Qwen/Qwen3-4B-Instruct-2507",
             "device": None,
-            "max_new_tokens": 1024,
+            # Lower to reduce VRAM (GRPO batch + long generations).
+            "max_new_tokens": 512,
             "temperature": 0.7,
         },
         "solver_model": {
             "model_name": "Qwen/Qwen3-4B-Instruct-2507",
             "device": None,
-            "max_new_tokens": 2048,
+            # Lower to reduce VRAM (quick-answer batch + generate_group).
+            "max_new_tokens": 1024,
             "temperature": 0.7,
         },
         "reward": {
@@ -68,9 +70,9 @@ def get_default_config() -> Dict[str, Any]:
             "rollout_trace_dir": None,
             "rollout_log_max_context_chars": 8000,
             "rollout_log_max_field_chars": 16000,
-            # Input-length caps (char-level pre-tokenization)
-            "max_context_chars_challenger": 6000,
-            "max_context_chars_solver": 4000,
+            # Input-length caps (char-level, before tokenizer). Tuned for ~80GB VRAM.
+            "max_context_chars_challenger": 4500,
+            "max_context_chars_solver": 3000,
             # Scale-up: with LoRA the two 4B models comfortably share one
             # 80GB card (~32GB peak), freeing the second card for DDP later.
             "colocate_models": True,
@@ -78,7 +80,8 @@ def get_default_config() -> Dict[str, Any]:
             "judge_concurrency": None,
         },
         "grpo": {
-            "group_size": 4,
+            # Lower G reduces batched GRPO / generate peak VRAM (try 4 if memory allows).
+            "group_size": 2,
             "clip_eps": 0.2,
             "kl_beta": 0.04,
             "adv_eps": 1e-8,
