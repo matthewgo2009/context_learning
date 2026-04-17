@@ -74,6 +74,22 @@ def parse_args():
         help="Disable bitsandbytes 8-bit AdamW (use torch.optim.AdamW instead)",
     )
     p.add_argument(
+        "--no-lora",
+        action="store_true",
+        help="Disable LoRA (full fine-tune). NOTE: requires ref-offload + "
+        "8-bit AdamW to fit on 2×80GB; LoRA is strongly recommended.",
+    )
+    p.add_argument(
+        "--lora-r", type=int, default=16, help="LoRA rank (default: 16)",
+    )
+    p.add_argument(
+        "--lora-alpha", type=int, default=32, help="LoRA alpha (default: 32)",
+    )
+    p.add_argument(
+        "--lora-dropout", type=float, default=0.05,
+        help="LoRA dropout (default: 0.05)",
+    )
+    p.add_argument(
         "--max-ctx-chars-challenger",
         type=int,
         default=None,
@@ -149,6 +165,12 @@ def main():
             "group_size": args.group_size,
             "kl_beta": args.kl_beta,
             "clip_eps": args.clip_eps,
+        },
+        "lora": {
+            "enabled": not args.no_lora,
+            "r": args.lora_r,
+            "alpha": args.lora_alpha,
+            "dropout": args.lora_dropout,
         },
     }
 

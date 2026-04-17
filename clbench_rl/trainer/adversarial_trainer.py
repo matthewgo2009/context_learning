@@ -70,29 +70,45 @@ class AdversarialTrainer:
         self.solver = self._build_solver()
         self.challenger = self._build_challenger()
 
-        self.solver_ref = self._build_reference(self.solver)
-        self.challenger_ref = self._build_reference_challenger(self.challenger)
-
-        # Keep ref models on CPU to save ~8 GB per GPU;
-        # they are moved to GPU briefly inside _do_grpo_update.
-        self.solver_ref.model.to("cpu")
-        self.challenger_ref.model.to("cpu")
-        torch.cuda.empty_cache()
-        logger.info("Reference models offloaded to CPU")
+        # LoRA mode: ref policy = same base model with the adapter disabled
+        # (see SolverModel.disabled_adapter). No separate frozen copy is
+        # instantiated, saving ~2× model memory per GPU.
+        self.use_lora = self.solver.use_lora and self.challenger.use_lora
+        self.solver_ref: Optional[SolverModel] = None
+        self.challenger_ref: Optional[ChallengeModel] = None
+        if not self.use_lora:
+            # Legacy path — full fine-tune fallback (also keeps 8-bit AdamW +
+            # ref-offload optimization from before).
+            self.solver_ref = self._build_reference(self.solver)
+            self.challenger_ref = self._build_reference_challenger(self.challenger)
+            self.solver_ref.model.to("cpu")
+            self.challenger_ref.model.to("cpu")
+            torch.cuda.empty_cache()
+            logger.info(
+                "Full fine-tune mode: reference models offloaded to CPU"
+            )
+        else:
+            logger.info(
+                "LoRA mode: reference policy uses `disable_adapter()` — "
+                "no separate ref model instantiated."
+            )
 
         self.reward_fn = self._build_reward()
 
         train_cfg = self.cfg.get("training", {})
-        use_8bit = train_cfg.get("use_8bit_optimizer", True)
+        # 8-bit AdamW is only useful when optimizing the full base model.
+        # In LoRA mode, trainable params are tiny (<1% of the model) so plain
+        # fp32 AdamW on LoRA weights is both simpler and faster.
+        use_8bit = train_cfg.get("use_8bit_optimizer", True) and not self.use_lora
         AdamWCls = self._resolve_adamw(use_8bit)
 
         self.solver_optimizer = AdamWCls(
-            self.solver.model.parameters(),
+            self._trainable_params(self.solver.model),
             lr=train_cfg.get("solver_lr", train_cfg.get("lr", 1e-5)),
             weight_decay=train_cfg.get("weight_decay", 0.01),
         )
         self.challenger_optimizer = AdamWCls(
-            self.challenger.model.parameters(),
+            self._trainable_params(self.challenger.model),
             lr=train_cfg.get("challenger_lr", train_cfg.get("lr", 1e-5)),
             weight_decay=train_cfg.get("weight_decay", 0.01),
         )
@@ -142,11 +158,16 @@ class AdversarialTrainer:
     # Model builders
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _trainable_params(model):
+        return [p for p in model.parameters() if p.requires_grad]
+
     def _build_solver(self) -> SolverModel:
         sm = self.cfg.get("solver_model", {})
         return SolverModel(
             model_name=sm.get("model_name", "Qwen/Qwen3-4B-Instruct-2507"),
             device=sm.get("device") or self.solver_device,
+            lora_cfg=self.cfg.get("lora"),
         )
 
     def _build_challenger(self) -> ChallengeModel:
@@ -154,6 +175,7 @@ class AdversarialTrainer:
         return ChallengeModel(
             model_name=cm.get("model_name", "Qwen/Qwen3-4B-Instruct-2507"),
             device=cm.get("device") or self.challenger_device,
+            lora_cfg=self.cfg.get("lora"),
         )
 
     def _build_reference(self, solver: SolverModel) -> SolverModel:
@@ -231,32 +253,48 @@ class AdversarialTrainer:
         return ((t - t.mean()) / (t.std() + eps)).tolist()
 
     def _do_grpo_update(self, model, ref_model, optimizer, group: GroupResult):
-        """Per-trajectory GRPO with ref-model CPU offloading.
+        """Per-trajectory GRPO update.
 
-        Phase 1: bring ref model to GPU, compute ref logprobs, send it back.
-        Phase 2: per-trajectory forward + immediate backward (no gradient
-                 checkpointing needed — only 1 graph alive at a time, and
-                 ref is off GPU so there's ~8 GB extra room).
+        Ref log-probs are obtained from:
+          * LoRA mode: `model.compute_per_token_logprobs_ref()` — same base
+            model with the adapter temporarily disabled. `ref_model` arg is
+            unused and may be None.
+          * Full fine-tune mode: the separate, CPU-offloaded `ref_model`.
+
+        Each trajectory runs its own forward + immediate backward, so only
+        one computation graph is alive at any time.
         """
         metrics: Dict[str, float] = {}
         device = model.model.device
         G = len(group.responses)
         input_ids = group.input_ids.to(device)
 
-        # ------ Phase 1: ref logprobs (ref briefly on GPU) ------
-        ref_model.model.to(device)
+        # ------ Phase 1: ref logprobs ------
         ref_lps: List[Optional[torch.Tensor]] = []
-        for i in range(G):
-            gen_ids = group.generated_ids_list[i].to(device)
-            if gen_ids.numel() == 0:
-                ref_lps.append(None)
-                continue
-            lp = ref_model.compute_per_token_logprobs_detached(input_ids, gen_ids)
-            ref_lps.append(lp.cpu())
-        ref_model.model.to("cpu")
-        torch.cuda.empty_cache()
+        if self.use_lora:
+            for i in range(G):
+                gen_ids = group.generated_ids_list[i].to(device)
+                if gen_ids.numel() == 0:
+                    ref_lps.append(None)
+                    continue
+                lp = model.compute_per_token_logprobs_ref(input_ids, gen_ids)
+                ref_lps.append(lp.detach())
+        else:
+            assert ref_model is not None, "ref_model required in full-FT mode"
+            ref_model.model.to(device)
+            for i in range(G):
+                gen_ids = group.generated_ids_list[i].to(device)
+                if gen_ids.numel() == 0:
+                    ref_lps.append(None)
+                    continue
+                lp = ref_model.compute_per_token_logprobs_detached(
+                    input_ids, gen_ids
+                )
+                ref_lps.append(lp.cpu())
+            ref_model.model.to("cpu")
+            torch.cuda.empty_cache()
 
-        # ------ Phase 2: GRPO mu-iterations (ref off GPU) ------
+        # ------ Phase 2: GRPO mu-iterations ------
         for _ in range(self.mu_iterations):
             model.model.train()
             optimizer.zero_grad()
@@ -292,7 +330,7 @@ class AdversarialTrainer:
 
             if n_valid > 0:
                 torch.nn.utils.clip_grad_norm_(
-                    model.model.parameters(), self.max_grad_norm
+                    self._trainable_params(model.model), self.max_grad_norm
                 )
                 optimizer.step()
 
@@ -682,11 +720,22 @@ class AdversarialTrainer:
     def _save_checkpoint(self, step: int) -> None:
         for name, model in [("solver", self.solver), ("challenger", self.challenger)]:
             path = self.checkpoint_dir / f"{name}_step_{step}"
-            model.model.save_pretrained(path)
-            model.tokenizer.save_pretrained(path)
-        logger.info("Checkpoint saved at step %d", step)
+            # In LoRA mode this writes just the adapter (~50 MB); in full-FT
+            # mode it writes the whole model.
+            model.save_adapter(path)
+        tag = "adapter" if self.use_lora else "full"
+        logger.info("Checkpoint [%s] saved at step %d", tag, step)
 
     def _sync_references(self) -> None:
+        """Periodic ref policy refresh.
+
+        In LoRA mode the reference policy is *always* the frozen base model
+        (adapter disabled), so there is nothing to sync — KL is computed
+        against the original base, which is the standard RLHF-with-LoRA
+        setup. We keep the method as a no-op for API compatibility.
+        """
+        if self.use_lora:
+            return
         cpu_sd = {k: v.cpu() for k, v in self.solver.model.state_dict().items()}
         self.solver_ref.model.load_state_dict(cpu_sd)
         cpu_sd = {k: v.cpu() for k, v in self.challenger.model.state_dict().items()}

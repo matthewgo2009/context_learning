@@ -8,13 +8,17 @@ compute_per_token_logprobs) mirroring SolverModel, so both models can
 be trained with policy gradient.
 """
 
+import logging
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+logger = logging.getLogger(__name__)
 
 CHALLENGER_SYSTEM_PROMPT = (
     "You are an expert question designer. Given a context passage, your job is to "
@@ -80,6 +84,7 @@ class ChallengeModel:
         device: Optional[str] = None,
         use_fast: bool = True,
         system_prompt: Optional[str] = None,
+        lora_cfg: Optional[Dict[str, Any]] = None,
     ):
         """
         Args:
@@ -87,6 +92,9 @@ class ChallengeModel:
             device: Device to load model on (None = auto).
             use_fast: Use fast tokenizer.
             system_prompt: Custom system prompt (defaults to CHALLENGER_SYSTEM_PROMPT).
+            lora_cfg: Optional PEFT-LoRA config dict; when enabled, the base
+                model is wrapped with a LoRA adapter. The reference policy is
+                recovered via `with model.disable_adapter():`.
         """
         self.model_name = model_name
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -101,10 +109,45 @@ class ChallengeModel:
             trust_remote_code=True,
         ).to(self.device)
 
-    def enable_gradient_checkpointing(self):
-        self.model.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={"use_reentrant": True}
+        self.lora_cfg = lora_cfg or {}
+        self.use_lora = bool(self.lora_cfg.get("enabled", False))
+        if self.use_lora:
+            self._apply_lora(self.lora_cfg)
+
+    def _apply_lora(self, cfg: Dict[str, Any]) -> None:
+        from peft import LoraConfig, TaskType, get_peft_model
+
+        lora_config = LoraConfig(
+            r=int(cfg.get("r", 16)),
+            lora_alpha=int(cfg.get("alpha", 32)),
+            lora_dropout=float(cfg.get("dropout", 0.05)),
+            target_modules=list(cfg.get("target_modules", [
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj",
+            ])),
+            bias=cfg.get("bias", "none"),
+            task_type=getattr(TaskType, cfg.get("task_type", "CAUSAL_LM")),
         )
+        self.model = get_peft_model(self.model, lora_config)
+        trainable = sum(
+            p.numel() for p in self.model.parameters() if p.requires_grad
+        )
+        total = sum(p.numel() for p in self.model.parameters())
+        logger.info(
+            "[Challenger] LoRA enabled (r=%d, alpha=%d): %.2fM / %.2fM params "
+            "trainable (%.3f%%)",
+            lora_config.r, lora_config.lora_alpha,
+            trainable / 1e6, total / 1e6,
+            100.0 * trainable / max(total, 1),
+        )
+
+    @contextmanager
+    def disabled_adapter(self):
+        if self.use_lora and hasattr(self.model, "disable_adapter"):
+            with self.model.disable_adapter():
+                yield
+        else:
+            yield
 
     def generate(
         self,
@@ -254,6 +297,31 @@ class ChallengeModel:
         log_probs = F.log_softmax(shift_logits.float(), dim=-1)
         token_log_probs = log_probs.gather(2, generated_ids.unsqueeze(-1)).squeeze(-1)
         return token_log_probs.squeeze(0)
+
+    @torch.no_grad()
+    def compute_per_token_logprobs_ref(
+        self,
+        input_ids: torch.Tensor,
+        generated_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Reference-policy per-token log-probs via disabled LoRA adapter."""
+        if generated_ids.numel() == 0:
+            return torch.zeros(0, device=self.model.device)
+        with self.disabled_adapter():
+            return self.compute_per_token_logprobs_detached(input_ids, generated_ids)
+
+    def save_adapter(self, path) -> None:
+        """Save LoRA adapter weights (or the full model if LoRA is disabled)."""
+        self.model.save_pretrained(str(path))
+        self.tokenizer.save_pretrained(str(path))
+
+    def load_adapter(self, path) -> None:
+        if not self.use_lora:
+            raise RuntimeError("load_adapter called but LoRA is not enabled")
+        from peft import PeftModel
+        base = self.model.get_base_model() if hasattr(self.model, "get_base_model") \
+            else self.model
+        self.model = PeftModel.from_pretrained(base, str(path)).to(self.device)
 
     def build_challenge_messages(self) -> List[dict]:
         """Build the default challenger prompt messages following template B.2."""

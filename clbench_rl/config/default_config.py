@@ -80,6 +80,21 @@ def get_default_config() -> Dict[str, Any]:
             "max_grad_norm": 1.0,
             "mu_iterations": 1,
         },
+        # LoRA adapter config (applied to both Solver and Challenger base models).
+        # Ref policy = same base model with the adapter disabled
+        # (`with model.disable_adapter(): ...`). No duplicate ref model needed.
+        "lora": {
+            "enabled": True,
+            "r": 16,
+            "alpha": 32,
+            "dropout": 0.05,
+            "target_modules": [
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj",
+            ],
+            "bias": "none",
+            "task_type": "CAUSAL_LM",
+        },
     }
 
 
