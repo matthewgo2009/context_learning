@@ -101,6 +101,26 @@ def parse_args():
         default=None,
         help="Truncate context to N chars before feeding the solver",
     )
+    p.add_argument(
+        "--colocate-models",
+        dest="colocate_models",
+        action="store_true",
+        default=None,
+        help="Place Solver and Challenger on the same GPU "
+        "(default: True when LoRA is on)",
+    )
+    p.add_argument(
+        "--no-colocate-models",
+        dest="colocate_models",
+        action="store_false",
+        help="Use legacy split: solver→cuda:0, challenger→cuda:1",
+    )
+    p.add_argument(
+        "--judge-concurrency",
+        type=int,
+        default=None,
+        help="Max parallel judge API calls per step (default: group_size)",
+    )
 
     p.add_argument("--use-llm-judge", action="store_true", default=True,
                     help="Use frozen LLM as Judge (default: True, requires OPENAI_API_KEY)")
@@ -160,6 +180,14 @@ def main():
                 {"max_context_chars_solver": args.max_ctx_chars_solver}
                 if args.max_ctx_chars_solver is not None else {}
             ),
+            **(
+                {"colocate_models": args.colocate_models}
+                if args.colocate_models is not None else {}
+            ),
+            **(
+                {"judge_concurrency": args.judge_concurrency}
+                if args.judge_concurrency is not None else {}
+            ),
         },
         "grpo": {
             "group_size": args.group_size,
@@ -174,8 +202,8 @@ def main():
         },
     }
 
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    if local_rank == 0:
+    is_rank0 = int(os.environ.get("RANK", "0")) == 0
+    if is_rank0:
         logger.info("Config: %s", json.dumps(config, indent=2, default=str))
 
     from clbench_rl.trainer.adversarial_trainer import AdversarialTrainer
@@ -183,7 +211,7 @@ def main():
     trainer = AdversarialTrainer(config=config)
     metrics = trainer.train()
 
-    if local_rank == 0:
+    if is_rank0:
         logger.info("Training complete.")
         print("\n" + "=" * 60)
         print("Adversarial Self-Play Training Complete")

@@ -10,6 +10,18 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 logger = logging.getLogger(__name__)
 
+def _strip_trailing_pad(x: torch.Tensor, pad_id: int) -> torch.Tensor:
+    """Trim the trailing pad tokens produced by batched `generate`."""
+    if pad_id is None or x.numel() == 0:
+        return x
+    mask = x != pad_id
+    nz = mask.nonzero(as_tuple=False)
+    if nz.numel() == 0:
+        return x[:0]
+    last = int(nz[-1].item()) + 1
+    return x[:last]
+
+
 SOLVER_SYSTEM_PROMPT = (
     "You are given a context and a question. Read the context carefully, "
     "reason step by step, and provide a clear, well-supported answer. "
@@ -221,20 +233,10 @@ class SolverModel:
         **kwargs,
     ) -> List[Tuple[str, torch.Tensor, torch.Tensor]]:
         """
-        Generate a group of G responses for the same prompt (GRPO sampling).
-
-        Each response is sampled independently. Returns G tuples of
-        (response_text, input_ids, generated_ids) for subsequent log-prob
-        computation and policy gradient.
-
-        Args:
-            messages: OpenAI chat format messages.
-            group_size: Number of responses G to sample per prompt.
-            max_new_tokens: Max tokens to generate per response.
-            temperature: Sampling temperature.
-
-        Returns:
-            List of G tuples: [(text, input_ids, generated_ids), ...]
+        Batched GRPO sampling: single `generate` call with
+        `num_return_sequences=G`. Replaces a Python for-loop of G sequential
+        generates. Trailing pad tokens are stripped per trajectory so that
+        `compute_per_token_logprobs` does not charge loss on padding.
         """
         messages = self._ensure_system_prompt(messages)
         prompt = self.tokenizer.apply_chat_template(
@@ -243,23 +245,70 @@ class SolverModel:
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
         input_ids = inputs["input_ids"]
 
-        results = []
+        pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+
         with torch.no_grad():
-            for _ in range(group_size):
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                do_sample=True,
+                num_return_sequences=group_size,
+                pad_token_id=pad_id,
+                **kwargs,
+            )
+
+        input_len = input_ids.shape[1]
+        results: List[Tuple[str, torch.Tensor, torch.Tensor]] = []
+        for g in range(group_size):
+            gen = _strip_trailing_pad(outputs[g, input_len:], pad_id)
+            gen_ids = gen.unsqueeze(0)
+            text = self.tokenizer.decode(gen, skip_special_tokens=True)
+            results.append((text.strip(), input_ids.detach(), gen_ids.detach()))
+        return results
+
+    def generate_batch(
+        self,
+        prompts: List[str],
+        max_new_tokens: int = 2048,
+        temperature: float = 0.7,
+        do_sample: bool = True,
+        **kwargs,
+    ) -> List[str]:
+        """Batched text generation for a list of ready-to-use prompt strings.
+
+        Uses **left-padding** (required so that the newly generated tokens
+        are appended at a consistent position for every sequence). Restores
+        the tokenizer's original `padding_side` on exit.
+        """
+        if not prompts:
+            return []
+        tok = self.tokenizer
+        old_side = tok.padding_side
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+        tok.padding_side = "left"
+        try:
+            inputs = tok(
+                prompts, return_tensors="pt", padding=True,
+            ).to(self.model.device)
+            with torch.no_grad():
                 outputs = self.model.generate(
-                    **{k: v.clone() for k, v in inputs.items()},
+                    **inputs,
                     max_new_tokens=max_new_tokens,
                     temperature=temperature,
-                    do_sample=True,
-                    pad_token_id=self.tokenizer.eos_token_id,
+                    do_sample=do_sample,
+                    pad_token_id=tok.eos_token_id,
                     **kwargs,
                 )
-                input_len = input_ids.shape[1]
-                gen_ids = outputs[:1, input_len:]
-                text = self.tokenizer.decode(gen_ids[0], skip_special_tokens=True)
-                results.append((text.strip(), input_ids.detach(), gen_ids.detach()))
-
-        return results
+            input_len = inputs["input_ids"].shape[1]
+            texts: List[str] = []
+            for i in range(len(prompts)):
+                gen = outputs[i, input_len:]
+                texts.append(tok.decode(gen, skip_special_tokens=True).strip())
+            return texts
+        finally:
+            tok.padding_side = old_side
 
     def compute_sequence_logprob(
         self,
@@ -340,6 +389,75 @@ class SolverModel:
         log_probs = F.log_softmax(shift_logits.float(), dim=-1)
         token_log_probs = log_probs.gather(2, generated_ids.unsqueeze(-1)).squeeze(-1)
         return token_log_probs.squeeze(0)
+
+    def compute_per_token_logprobs_batched(
+        self,
+        input_ids: torch.Tensor,
+        generated_ids_list: List[torch.Tensor],
+    ) -> List[torch.Tensor]:
+        """Differentiable per-token log-probs for G trajectories sharing the
+        same prompt, in a **single forward pass**.
+
+        Right-pads the generated part and sets `attention_mask` so padded
+        positions do not leak into attention. Returns one [L_i] tensor per
+        trajectory, all sharing a single computation graph — aggregate the
+        losses and call `.backward()` once.
+        """
+        G = len(generated_ids_list)
+        if G == 0:
+            return []
+        device = self.model.device
+        P = input_ids.shape[1]
+        lens = [int(g.shape[1]) for g in generated_ids_list]
+        max_L = max(lens) if lens else 0
+        if max_L == 0:
+            return [
+                torch.zeros(0, device=device, requires_grad=True)
+                for _ in range(G)
+            ]
+
+        pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+        full = torch.full((G, P + max_L), pad_id, dtype=torch.long, device=device)
+        attn = torch.zeros((G, P + max_L), dtype=torch.long, device=device)
+        gen_padded = torch.full((G, max_L), pad_id, dtype=torch.long, device=device)
+        for i, gen in enumerate(generated_ids_list):
+            L = lens[i]
+            full[i, :P] = input_ids[0]
+            if L > 0:
+                full[i, P:P + L] = gen[0]
+                gen_padded[i, :L] = gen[0]
+            attn[i, :P + L] = 1
+
+        outputs = self.model(full, attention_mask=attn, use_cache=False)
+        shift_logits = outputs.logits[:, P - 1:P + max_L - 1, :]
+        log_probs = F.log_softmax(shift_logits.float(), dim=-1)
+        token_lp = log_probs.gather(2, gen_padded.unsqueeze(-1)).squeeze(-1)
+        return [token_lp[i, :lens[i]] for i in range(G)]
+
+    @torch.no_grad()
+    def compute_per_token_logprobs_detached_batched(
+        self,
+        input_ids: torch.Tensor,
+        generated_ids_list: List[torch.Tensor],
+    ) -> List[torch.Tensor]:
+        """No-grad batched per-token log-probs."""
+        return self.compute_per_token_logprobs_batched(
+            input_ids, generated_ids_list
+        )
+
+    @torch.no_grad()
+    def compute_per_token_logprobs_ref_batched(
+        self,
+        input_ids: torch.Tensor,
+        generated_ids_list: List[torch.Tensor],
+    ) -> List[torch.Tensor]:
+        """Reference-policy batched per-token log-probs (LoRA disabled)."""
+        if not generated_ids_list:
+            return []
+        with self.disabled_adapter():
+            return self.compute_per_token_logprobs_batched(
+                input_ids, generated_ids_list
+            )
 
     @torch.no_grad()
     def compute_per_token_logprobs_ref(

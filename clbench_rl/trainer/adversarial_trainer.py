@@ -16,6 +16,7 @@ Training loop (per epoch):
 Supports DeepSpeed ZeRO via Accelerate for 8×H100 training.
 """
 
+import concurrent.futures
 import json
 import logging
 import os
@@ -24,6 +25,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 from tqdm import tqdm
 
 from ..config.default_config import merge_config
@@ -64,6 +66,8 @@ class AdversarialTrainer:
         self.adv_eps = grpo.get("adv_eps", 1e-8)
         self.max_grad_norm = grpo.get("max_grad_norm", 1.0)
         self.mu_iterations = grpo.get("mu_iterations", 1)
+
+        self._init_distributed()
 
         self.solver_device, self.challenger_device = self._assign_devices()
 
@@ -119,9 +123,51 @@ class AdversarialTrainer:
         rw_cfg = self.cfg.get("reward", {})
         self.rep_batch_size = rw_cfg.get("repetition_batch_size", 16)
 
+        # Scale-up: parallelise judge API calls per step (I/O bound).
+        jc = train_cfg.get("judge_concurrency")
+        self.judge_concurrency = int(jc) if jc else max(self.group_size, 1)
+
     # ------------------------------------------------------------------
-    # Device assignment
+    # Distributed init & device assignment
     # ------------------------------------------------------------------
+
+    def _init_distributed(self) -> None:
+        """Initialise torch.distributed if launched via torchrun.
+
+        Detection is purely env-driven (`WORLD_SIZE`, `RANK`, `LOCAL_RANK`),
+        so plain `python scripts/train_adversarial.py` keeps working
+        single-process with `world_size=1`.
+
+        We deliberately do **not** wrap models in `DistributedDataParallel`.
+        In LoRA-GRPO the training-time forward paths include `generate()`,
+        `disable_adapter()` and a hand-written batched logprob kernel, none
+        of which play nicely with DDP's module wrapper. Instead we manually
+        `all_reduce` LoRA gradients just before `optimizer.step()` — this
+        is the approach used by trl / openrlhf and keeps `self.model` a
+        plain `PeftModel`.
+        """
+        ws = int(os.environ.get("WORLD_SIZE", "1"))
+        self.world_size = ws
+        self.rank = int(os.environ.get("RANK", "0"))
+        self.local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        self.is_rank0 = self.rank == 0
+
+        if ws > 1 and not dist.is_initialized():
+            backend = "nccl" if torch.cuda.is_available() else "gloo"
+            if torch.cuda.is_available():
+                torch.cuda.set_device(self.local_rank)
+            dist.init_process_group(backend=backend)
+            logger.info(
+                "torch.distributed initialised: rank=%d/%d local_rank=%d backend=%s",
+                self.rank, ws, self.local_rank, backend,
+            )
+
+    def _is_distributed(self) -> bool:
+        return self.world_size > 1 and dist.is_available() and dist.is_initialized()
+
+    def _barrier(self) -> None:
+        if self._is_distributed():
+            dist.barrier()
 
     @staticmethod
     def _resolve_adamw(use_8bit: bool):
@@ -143,16 +189,47 @@ class AdversarialTrainer:
                 )
         return torch.optim.AdamW
 
-    @staticmethod
-    def _assign_devices():
+    def _assign_devices(self):
+        """Place Solver and Challenger on GPU(s).
+
+        - DDP mode (torchrun, world_size > 1): each rank pins to
+          `cuda:{LOCAL_RANK}` and hosts a full Solver+Challenger pair.
+        - Single-process: honour `training.colocate_models` (default True),
+          else fall back to the legacy split (solver→cuda:0,
+          challenger→cuda:1).
+        """
         n = torch.cuda.device_count()
+        train_cfg = self.cfg.get("training", {})
+        colocate = train_cfg.get("colocate_models", True)
+
+        if n == 0:
+            logger.info("No GPU detected — running on CPU")
+            return "cpu", "cpu"
+
+        if self._is_distributed():
+            dev = f"cuda:{self.local_rank}"
+            logger.info(
+                "DDP rank=%d: Solver+Challenger co-located on %s",
+                self.rank, dev,
+            )
+            return dev, dev
+
+        if colocate:
+            idx = self.local_rank if self.local_rank < n else 0
+            dev = f"cuda:{idx}"
+            logger.info(
+                "Co-locating Solver and Challenger on %s "
+                "(LoRA leaves ample headroom on 80GB)",
+                dev,
+            )
+            return dev, dev
+
         if n >= 2:
-            logger.info("2+ GPUs detected — solver→cuda:0, challenger→cuda:1")
+            logger.info("Split mode: solver→cuda:0, challenger→cuda:1")
             return "cuda:0", "cuda:1"
-        if n == 1:
-            logger.info("Single GPU — all models on cuda:0")
-            return "cuda:0", "cuda:0"
-        return "cpu", "cpu"
+
+        logger.info("Single GPU — all models on cuda:0")
+        return "cuda:0", "cuda:0"
 
     # ------------------------------------------------------------------
     # Model builders
@@ -161,6 +238,21 @@ class AdversarialTrainer:
     @staticmethod
     def _trainable_params(model):
         return [p for p in model.parameters() if p.requires_grad]
+
+    def _allreduce_grads(self, model) -> None:
+        """Average LoRA grads across ranks (manual DDP).
+
+        No-op when `world_size == 1`. Called just before `optimizer.step()`
+        so every rank applies the same update on its local LoRA weights.
+        """
+        if not self._is_distributed():
+            return
+        ws = float(self.world_size)
+        for p in self._trainable_params(model):
+            if p.grad is None:
+                continue
+            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+            p.grad.mul_(1.0 / ws)
 
     def _build_solver(self) -> SolverModel:
         sm = self.cfg.get("solver_model", {})
@@ -253,61 +345,63 @@ class AdversarialTrainer:
         return ((t - t.mean()) / (t.std() + eps)).tolist()
 
     def _do_grpo_update(self, model, ref_model, optimizer, group: GroupResult):
-        """Per-trajectory GRPO update.
+        """Batched GRPO update.
 
-        Ref log-probs are obtained from:
-          * LoRA mode: `model.compute_per_token_logprobs_ref()` — same base
-            model with the adapter temporarily disabled. `ref_model` arg is
-            unused and may be None.
-          * Full fine-tune mode: the separate, CPU-offloaded `ref_model`.
+        Ref log-probs:
+          * LoRA mode: `model.compute_per_token_logprobs_ref_batched()` —
+            same base model with adapter disabled, one batched forward for
+            all G trajectories.
+          * Full-FT mode: separate CPU-offloaded `ref_model`, also batched.
 
-        Each trajectory runs its own forward + immediate backward, so only
-        one computation graph is alive at any time.
+        Policy log-probs: one batched forward over all valid trajectories.
+        All per-trajectory losses are summed into a single scalar and we
+        call `.backward()` **once** — gradients from every trajectory share
+        the same computation graph.
         """
-        metrics: Dict[str, float] = {}
+        metrics: Dict[str, float] = {
+            "policy_loss": 0.0, "kl": 0.0, "total_loss": 0.0,
+        }
         device = model.model.device
         G = len(group.responses)
         input_ids = group.input_ids.to(device)
+        gen_list = [g.to(device) for g in group.generated_ids_list]
 
-        # ------ Phase 1: ref logprobs ------
-        ref_lps: List[Optional[torch.Tensor]] = []
+        valid_idx = [i for i in range(G) if gen_list[i].numel() > 0]
+        if not valid_idx:
+            return metrics
+        valid_gens = [gen_list[i] for i in valid_idx]
+
+        # ---- Phase 1: ref logprobs (batched) ----
         if self.use_lora:
-            for i in range(G):
-                gen_ids = group.generated_ids_list[i].to(device)
-                if gen_ids.numel() == 0:
-                    ref_lps.append(None)
-                    continue
-                lp = model.compute_per_token_logprobs_ref(input_ids, gen_ids)
-                ref_lps.append(lp.detach())
+            ref_lps = model.compute_per_token_logprobs_ref_batched(
+                input_ids, valid_gens
+            )
         else:
             assert ref_model is not None, "ref_model required in full-FT mode"
             ref_model.model.to(device)
-            for i in range(G):
-                gen_ids = group.generated_ids_list[i].to(device)
-                if gen_ids.numel() == 0:
-                    ref_lps.append(None)
-                    continue
-                lp = ref_model.compute_per_token_logprobs_detached(
-                    input_ids, gen_ids
-                )
-                ref_lps.append(lp.cpu())
+            ref_lps = ref_model.compute_per_token_logprobs_detached_batched(
+                input_ids, valid_gens
+            )
             ref_model.model.to("cpu")
             torch.cuda.empty_cache()
 
-        # ------ Phase 2: GRPO mu-iterations ------
+        # ---- Phase 2: GRPO mu-iterations (batched fwd + single bwd) ----
         for _ in range(self.mu_iterations):
             model.model.train()
             optimizer.zero_grad()
-            n_valid = 0
+
+            cur_lps = model.compute_per_token_logprobs_batched(
+                input_ids, valid_gens
+            )
+
+            total_loss: Optional[torch.Tensor] = None
             sum_policy = 0.0
             sum_kl = 0.0
+            scale = max(len(valid_idx), 1)
 
-            for i in range(G):
-                gen_ids = group.generated_ids_list[i].to(device)
-                if gen_ids.numel() == 0 or ref_lps[i] is None:
-                    continue
-
-                cur_lp = model.compute_per_token_logprobs(input_ids, gen_ids)
+            for k, i in enumerate(valid_idx):
+                cur_lp = cur_lps[k]
+                ref_lp = ref_lps[k].to(device)
                 old_lp = cur_lp.detach()
 
                 ratio = torch.exp(cur_lp - old_lp)
@@ -319,26 +413,26 @@ class AdversarialTrainer:
                     ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps
                 ) * adv
                 p_loss_i = -torch.min(surr1, surr2).mean()
-                kl_i = (cur_lp - ref_lps[i].to(device)).mean()
+                kl_i = (cur_lp - ref_lp).mean()
 
-                loss_i = (p_loss_i + self.kl_beta * kl_i) / max(G, 1)
-                loss_i.backward()
+                loss_i = (p_loss_i + self.kl_beta * kl_i) / scale
+                total_loss = loss_i if total_loss is None else total_loss + loss_i
 
                 sum_policy += p_loss_i.item()
                 sum_kl += kl_i.item()
-                n_valid += 1
 
-            if n_valid > 0:
+            if total_loss is not None:
+                total_loss.backward()
+                self._allreduce_grads(model.model)
                 torch.nn.utils.clip_grad_norm_(
                     self._trainable_params(model.model), self.max_grad_norm
                 )
                 optimizer.step()
 
-            n = max(n_valid, 1)
             metrics = {
-                "policy_loss": sum_policy / n,
-                "kl": sum_kl / n,
-                "total_loss": (sum_policy + self.kl_beta * sum_kl) / n,
+                "policy_loss": sum_policy / scale,
+                "kl": sum_kl / scale,
+                "total_loss": (sum_policy + self.kl_beta * sum_kl) / scale,
             }
 
         model.model.eval()
@@ -409,7 +503,7 @@ class AdversarialTrainer:
         ref_sync_every = train_cfg.get("ref_sync_every", 200)
 
         save_rollouts = train_cfg.get("save_rollout_traces", True)
-        is_rank0 = int(os.environ.get("LOCAL_RANK", "0")) == 0
+        is_rank0 = self.is_rank0
         ckpt_root = Path(train_cfg.get("checkpoint_dir", "checkpoints"))
         trace_dir_cfg = train_cfg.get("rollout_trace_dir")
         rollout_trace_dir = (
@@ -432,6 +526,13 @@ class AdversarialTrainer:
         max_ctx_sv = int(train_cfg.get("max_context_chars_solver", 4000))
 
         samples = list(loader)
+        if self._is_distributed():
+            full_n = len(samples)
+            samples = samples[self.rank::self.world_size]
+            logger.info(
+                "DDP rank %d/%d: %d samples (of %d total)",
+                self.rank, self.world_size, len(samples), full_n,
+            )
         global_step = 0
 
         acc = {
@@ -443,10 +544,14 @@ class AdversarialTrainer:
         n = 0
 
         metrics_path = Path(train_cfg.get("checkpoint_dir", "checkpoints")) / "metrics.jsonl"
-        ml = MetricsLogger(metrics_path, flush_every=max(1, log_every))
+        ml = MetricsLogger(metrics_path, flush_every=max(1, log_every)) if is_rank0 else None
 
         for epoch in range(epochs):
-            iterator = tqdm(samples, desc=f"Epoch {epoch+1}/{epochs}")
+            iterator = tqdm(
+                samples,
+                desc=f"Epoch {epoch+1}/{epochs}",
+                disable=not is_rank0,
+            )
 
             batch_questions: List[str] = []
 
@@ -484,51 +589,74 @@ class AdversarialTrainer:
                 else:
                     rep_penalties = self.reward_fn.compute_batch_repetition(batch_questions)
 
-                # For each challenger output, compute challenger reward
-                # We need a solver answer first — generate one quick answer per (Q,E,R)
-                c_rewards = []
-                c_reward_details: List[ChallengeRewardResult] = []
-                best_idx = 0
-                best_c_reward = float("-inf")
-
+                # For each challenger output, compute challenger reward.
+                # Scale-up: (a) batch the G quick-answer generates into one
+                # padded generate call; (b) fan out the 2×G judge API calls
+                # across a thread-pool (I/O bound).
+                sv_tok = self.solver.tokenizer
+                quick_prompts: List[str] = []
                 for gi, parsed in enumerate(parsed_outputs):
                     q_text = parsed.question or c_texts[gi]
-                    solver_msgs = [
+                    msgs = self.solver._ensure_system_prompt([
                         {"role": "system", "content": sv_context[:2000]},
                         {"role": "user", "content": q_text},
-                    ]
-                    with torch.no_grad():
-                        answer = self.solver.generate(
-                            solver_msgs,
-                            max_new_tokens=sm_cfg.get("max_new_tokens", 2048),
-                            temperature=0.3,
+                    ])
+                    quick_prompts.append(
+                        sv_tok.apply_chat_template(
+                            msgs, tokenize=False, add_generation_prompt=True,
                         )
-
-                    rubrics = [parsed.rubric] if parsed.rubric else sample.get("rubrics", [])
-
-                    s_result = self.reward_fn.compute_solver_reward(
-                        answer=answer, rubrics=rubrics,
-                        context=context, metadata=sample.get("metadata", {}),
                     )
 
-                    rep_idx = min(gi, len(rep_penalties) - 1) if rep_penalties else 0
-                    rep_val = rep_penalties[rep_idx] if rep_penalties else 0.0
+                quick_answers = self.solver.generate_batch(
+                    quick_prompts,
+                    max_new_tokens=sm_cfg.get("max_new_tokens", 2048),
+                    temperature=0.3,
+                )
 
-                    c_result = self.reward_fn.compute_challenge_reward(
-                        solver_correctness=s_result.correctness,
+                G_c = len(parsed_outputs)
+                rubrics_list = [
+                    ([p.rubric] if p.rubric else sample.get("rubrics", []))
+                    for p in parsed_outputs
+                ]
+                meta = sample.get("metadata", {})
+
+                def _eval_pair(gi: int):
+                    parsed = parsed_outputs[gi]
+                    s_res = self.reward_fn.compute_solver_reward(
+                        answer=quick_answers[gi], rubrics=rubrics_list[gi],
+                        context=context, metadata=meta,
+                    )
+                    rep_idx = (
+                        min(gi, len(rep_penalties) - 1) if rep_penalties else 0
+                    )
+                    rep_val = rep_penalties[rep_idx] if rep_penalties else 0.0
+                    c_res = self.reward_fn.compute_challenge_reward(
+                        solver_correctness=s_res.correctness,
                         challenge_output=c_texts[gi],
                         context=context,
                         question=parsed.question,
-                        rubrics=rubrics,
-                        metadata=sample.get("metadata", {}),
+                        rubrics=rubrics_list[gi],
+                        metadata=meta,
                         evidence_span=parsed.evidence_span,
                         batch_repetition_penalty=rep_val,
                     )
-                    c_rewards.append(c_result.total)
-                    c_reward_details.append(c_result)
+                    return gi, s_res, c_res
 
-                    if c_result.total > best_c_reward:
-                        best_c_reward = c_result.total
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=min(G_c, self.judge_concurrency)
+                ) as ex:
+                    pair_results = list(ex.map(_eval_pair, range(G_c)))
+                pair_results.sort(key=lambda x: x[0])
+
+                c_rewards: List[float] = []
+                c_reward_details: List[ChallengeRewardResult] = []
+                best_idx = 0
+                best_c_reward = float("-inf")
+                for gi, _s_res, c_res in pair_results:
+                    c_rewards.append(c_res.total)
+                    c_reward_details.append(c_res)
+                    if c_res.total > best_c_reward:
+                        best_c_reward = c_res.total
                         best_idx = gi
 
                 # === Phase 2: GRPO update Challenger ===
@@ -568,15 +696,17 @@ class AdversarialTrainer:
                 s_input_ids = s_group_raw[0][1]
                 s_gen_ids_list = [r[2] for r in s_group_raw]
 
-                s_rewards = []
-                s_breakdowns = []
-                for ans in s_texts:
-                    sr = self.reward_fn.compute_solver_reward(
+                def _score_solver(ans: str):
+                    return self.reward_fn.compute_solver_reward(
                         answer=ans, rubrics=best_rubrics,
                         context=context, metadata=sample.get("metadata", {}),
                     )
-                    s_rewards.append(sr.total)
-                    s_breakdowns.append(sr)
+
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=min(len(s_texts) or 1, self.judge_concurrency)
+                ) as ex:
+                    s_breakdowns = list(ex.map(_score_solver, s_texts))
+                s_rewards = [sr.total for sr in s_breakdowns]
 
                 # === Phase 4: GRPO update Solver ===
                 s_advantages = self._compute_advantages(s_rewards, self.adv_eps)
@@ -668,31 +798,36 @@ class AdversarialTrainer:
                 acc["solver_loss"] += s_metrics.get("total_loss", 0.0)
                 acc["challenger_loss"] += c_metrics.get("total_loss", 0.0)
 
-                if global_step % log_every == 0 and n > 0:
+                if global_step % log_every == 0 and n > 0 and is_rank0:
                     iterator.set_postfix(
                         j=round(acc["j_score"] / n, 4),
                         s_loss=round(acc["solver_loss"] / n, 4),
                         c_loss=round(acc["challenger_loss"] / n, 4),
                         c_r=round(acc["challenger_reward"] / n, 4),
                     )
-                    ml.log(
-                        step=global_step, epoch=epoch,
-                        j_score=mean_j,
-                        solver_reward=sum(s_rewards) / max(len(s_rewards), 1),
-                        challenger_reward=sum(c_rewards) / max(len(c_rewards), 1),
-                        solver_loss=s_metrics.get("total_loss", 0.0),
-                        challenger_loss=c_metrics.get("total_loss", 0.0),
-                        solver_policy_loss=s_metrics.get("policy_loss", 0.0),
-                        challenger_policy_loss=c_metrics.get("policy_loss", 0.0),
-                        solver_kl=s_metrics.get("kl_penalty", 0.0),
-                        challenger_kl=c_metrics.get("kl_penalty", 0.0),
-                        avg_j_score=acc["j_score"] / n,
-                        avg_solver_reward=acc["solver_reward"] / n,
-                        avg_challenger_reward=acc["challenger_reward"] / n,
-                    )
+                    if ml is not None:
+                        ml.log(
+                            step=global_step, epoch=epoch,
+                            j_score=mean_j,
+                            solver_reward=sum(s_rewards) / max(len(s_rewards), 1),
+                            challenger_reward=sum(c_rewards) / max(len(c_rewards), 1),
+                            solver_loss=s_metrics.get("total_loss", 0.0),
+                            challenger_loss=c_metrics.get("total_loss", 0.0),
+                            solver_policy_loss=s_metrics.get("policy_loss", 0.0),
+                            challenger_policy_loss=c_metrics.get("policy_loss", 0.0),
+                            solver_kl=s_metrics.get("kl_penalty", 0.0),
+                            challenger_kl=c_metrics.get("kl_penalty", 0.0),
+                            avg_j_score=acc["j_score"] / n,
+                            avg_solver_reward=acc["solver_reward"] / n,
+                            avg_challenger_reward=acc["challenger_reward"] / n,
+                        )
 
-                if save_every and global_step % save_every == 0:
+                if save_every and global_step % save_every == 0 and is_rank0:
                     self._save_checkpoint(global_step)
+                # Keep all ranks in lock-step after a checkpoint so that
+                # rank 0 doesn't fall behind while writing.
+                if save_every and global_step % save_every == 0:
+                    self._barrier()
 
                 if ref_sync_every and global_step % ref_sync_every == 0:
                     self._sync_references()
@@ -700,17 +835,25 @@ class AdversarialTrainer:
             # Trim batch_questions per epoch to avoid unbounded growth
             batch_questions = batch_questions[-self.rep_batch_size * 4:]
 
-        self._save_checkpoint(global_step)
-        ml.close()
-        logger.info("Metrics saved to %s", metrics_path)
+        if is_rank0:
+            self._save_checkpoint(global_step)
+            if ml is not None:
+                ml.close()
+            logger.info("Metrics saved to %s", metrics_path)
+        self._barrier()
 
         out = {k: v / max(n, 1) for k, v in acc.items()} | {
             "global_steps": global_step,
             "epochs": epochs,
             "metrics_file": str(metrics_path),
+            "world_size": self.world_size,
+            "rank": self.rank,
         }
         if save_rollouts and is_rank0:
             out["rollout_trace_file"] = str(rollout_jsonl)
+
+        if self._is_distributed() and dist.is_initialized():
+            dist.destroy_process_group()
         return out
 
     # ------------------------------------------------------------------

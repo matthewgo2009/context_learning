@@ -20,6 +20,18 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 logger = logging.getLogger(__name__)
 
+def _strip_trailing_pad(x: torch.Tensor, pad_id: int) -> torch.Tensor:
+    """Trim trailing pad tokens produced by batched `generate`."""
+    if pad_id is None or x.numel() == 0:
+        return x
+    mask = x != pad_id
+    nz = mask.nonzero(as_tuple=False)
+    if nz.numel() == 0:
+        return x[:0]
+    last = int(nz[-1].item()) + 1
+    return x[:last]
+
+
 CHALLENGER_SYSTEM_PROMPT = (
     "You are an expert question designer. Given a context passage, your job is to "
     "craft a challenging, non-trivial question that requires deep comprehension of "
@@ -238,7 +250,7 @@ class ChallengeModel:
         temperature: float = 0.7,
         **kwargs,
     ) -> List[Tuple[str, torch.Tensor, torch.Tensor]]:
-        """Sample G (Q,E,R) outputs for GRPO-style training."""
+        """Batched GRPO sampling (num_return_sequences=G)."""
         messages = self._ensure_system_prompt(messages)
         prompt = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True,
@@ -246,21 +258,26 @@ class ChallengeModel:
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
         input_ids = inputs["input_ids"]
 
-        results = []
+        pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+
         with torch.no_grad():
-            for _ in range(group_size):
-                outputs = self.model.generate(
-                    **{k: v.clone() for k, v in inputs.items()},
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    do_sample=True,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                    **kwargs,
-                )
-                input_len = input_ids.shape[1]
-                gen_ids = outputs[:1, input_len:]
-                text = self.tokenizer.decode(gen_ids[0], skip_special_tokens=True)
-                results.append((text.strip(), input_ids.detach(), gen_ids.detach()))
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                do_sample=True,
+                num_return_sequences=group_size,
+                pad_token_id=pad_id,
+                **kwargs,
+            )
+
+        input_len = input_ids.shape[1]
+        results: List[Tuple[str, torch.Tensor, torch.Tensor]] = []
+        for g in range(group_size):
+            gen = _strip_trailing_pad(outputs[g, input_len:], pad_id)
+            gen_ids = gen.unsqueeze(0)
+            text = self.tokenizer.decode(gen, skip_special_tokens=True)
+            results.append((text.strip(), input_ids.detach(), gen_ids.detach()))
         return results
 
     def compute_per_token_logprobs(
@@ -297,6 +314,67 @@ class ChallengeModel:
         log_probs = F.log_softmax(shift_logits.float(), dim=-1)
         token_log_probs = log_probs.gather(2, generated_ids.unsqueeze(-1)).squeeze(-1)
         return token_log_probs.squeeze(0)
+
+    def compute_per_token_logprobs_batched(
+        self,
+        input_ids: torch.Tensor,
+        generated_ids_list: List[torch.Tensor],
+    ) -> List[torch.Tensor]:
+        """Differentiable batched per-token log-probs (single forward)."""
+        G = len(generated_ids_list)
+        if G == 0:
+            return []
+        device = self.model.device
+        P = input_ids.shape[1]
+        lens = [int(g.shape[1]) for g in generated_ids_list]
+        max_L = max(lens) if lens else 0
+        if max_L == 0:
+            return [
+                torch.zeros(0, device=device, requires_grad=True)
+                for _ in range(G)
+            ]
+
+        pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+        full = torch.full((G, P + max_L), pad_id, dtype=torch.long, device=device)
+        attn = torch.zeros((G, P + max_L), dtype=torch.long, device=device)
+        gen_padded = torch.full((G, max_L), pad_id, dtype=torch.long, device=device)
+        for i, gen in enumerate(generated_ids_list):
+            L = lens[i]
+            full[i, :P] = input_ids[0]
+            if L > 0:
+                full[i, P:P + L] = gen[0]
+                gen_padded[i, :L] = gen[0]
+            attn[i, :P + L] = 1
+
+        outputs = self.model(full, attention_mask=attn, use_cache=False)
+        shift_logits = outputs.logits[:, P - 1:P + max_L - 1, :]
+        log_probs = F.log_softmax(shift_logits.float(), dim=-1)
+        token_lp = log_probs.gather(2, gen_padded.unsqueeze(-1)).squeeze(-1)
+        return [token_lp[i, :lens[i]] for i in range(G)]
+
+    @torch.no_grad()
+    def compute_per_token_logprobs_detached_batched(
+        self,
+        input_ids: torch.Tensor,
+        generated_ids_list: List[torch.Tensor],
+    ) -> List[torch.Tensor]:
+        return self.compute_per_token_logprobs_batched(
+            input_ids, generated_ids_list
+        )
+
+    @torch.no_grad()
+    def compute_per_token_logprobs_ref_batched(
+        self,
+        input_ids: torch.Tensor,
+        generated_ids_list: List[torch.Tensor],
+    ) -> List[torch.Tensor]:
+        """Reference-policy batched per-token log-probs (LoRA disabled)."""
+        if not generated_ids_list:
+            return []
+        with self.disabled_adapter():
+            return self.compute_per_token_logprobs_batched(
+                input_ids, generated_ids_list
+            )
 
     @torch.no_grad()
     def compute_per_token_logprobs_ref(

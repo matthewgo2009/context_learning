@@ -71,6 +71,11 @@ def get_default_config() -> Dict[str, Any]:
             # Input-length caps (char-level pre-tokenization)
             "max_context_chars_challenger": 6000,
             "max_context_chars_solver": 4000,
+            # Scale-up: with LoRA the two 4B models comfortably share one
+            # 80GB card (~32GB peak), freeing the second card for DDP later.
+            "colocate_models": True,
+            # Max parallel judge-API calls per step. None → group_size.
+            "judge_concurrency": None,
         },
         "grpo": {
             "group_size": 4,
